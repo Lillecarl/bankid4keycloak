@@ -13,6 +13,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.Locale;
 import java.util.regex.Pattern;
 
@@ -41,6 +42,7 @@ import org.keycloak.services.managers.AuthenticationSessionManager;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
 import org.keycloak.util.JsonSerialization;
+import org.keycloak.vault.VaultStringSecret;
 
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.client.j2se.MatrixToImageWriter;
@@ -413,6 +415,10 @@ public class BankidEndpoint {
 		identity.setUsername(username);
 		identity.setFirstName(user.getGivenName());
 		identity.setLastName(user.getSurname());
+		if (pseudonymSecret() != null) {
+			// Kept on the user, for an admin, instead of in the username.
+			identity.getContextData().put(BankidIdentityProvider.CONTEXT_PERSONAL_NUMBER, user.getPersonalNumber());
+		}
 
 		setUserSessionNote(authSession, ".pnr", username);
 		setUserSessionNote(authSession, ".issuedate", completionData.getBankIdIssueDate());
@@ -431,13 +437,40 @@ public class BankidEndpoint {
 		}
 	}
 
+	/**
+	 * The username, which is also the federated id. With a pseudonym secret it
+	 * is HMAC-SHA256(secret, personal number) in hex: stable, and not
+	 * reversible without the secret. The unkeyed hash is reversible: there
+	 * are only a few tens of millions of personal numbers.
+	 */
 	private String getUsername(BankidUser user) throws NoSuchAlgorithmException {
+		String secret = pseudonymSecret();
+		if (secret != null) {
+			try {
+				Mac mac = Mac.getInstance("HmacSHA256");
+				mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+				return HexFormat.of().formatHex(mac.doFinal(user.getPersonalNumber().getBytes(StandardCharsets.UTF_8)));
+			} catch (InvalidKeyException e) {
+				throw new IllegalStateException("BankID: unusable pseudonym secret", e);
+			}
+		}
 		if (this.config.isSaveNinHashed()) {
 			MessageDigest md = MessageDigest.getInstance("SHA-256");
 			md.update(user.getPersonalNumber().getBytes(StandardCharsets.UTF_8));
 			return Base64.getEncoder().encodeToString(md.digest());
 		} else {
 			return user.getPersonalNumber();
+		}
+	}
+
+	private String pseudonymSecret() {
+		String value = config.getPseudonymSecret();
+		if (value == null || value.isEmpty()) {
+			return null;
+		}
+		try (VaultStringSecret secret = session.vault().getStringSecret(value)) {
+			return secret.get().orElseThrow(
+					() -> new IllegalStateException("BankID: the vault has no secret for the pseudonym"));
 		}
 	}
 
