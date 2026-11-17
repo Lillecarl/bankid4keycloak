@@ -1,22 +1,15 @@
 package org.keycloak.broker.bankid.model;
 
-import org.infinispan.protostream.annotations.ProtoField;
-
 public class AuthResponse {
 
-	@ProtoField(number = 1)
 	String orderRef;
 
-	@ProtoField(number = 2)
 	String autoStartToken;
 
-	@ProtoField(number = 3)
 	String qrStartToken;
 
-	@ProtoField(number = 4)
 	String qrStartSecret;
 
-	@ProtoField(number = 5)
 	Long authTimestamp;
 
 	public void setAutoStartToken(String autoStartToken) {
