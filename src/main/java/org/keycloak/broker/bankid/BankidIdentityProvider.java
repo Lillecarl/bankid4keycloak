@@ -15,6 +15,7 @@ import org.keycloak.models.FederatedIdentityModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserSessionModel;
 
 public class BankidIdentityProvider extends AbstractIdentityProvider<BankidIdentityProviderConfig> {
 
@@ -49,6 +50,16 @@ public class BankidIdentityProvider extends AbstractIdentityProvider<BankidIdent
 	@Override
 	public Response retrieveToken(KeycloakSession session, FederatedIdentityModel identity) {
 		return Response.ok(identity.getToken()).build();
+	}
+
+	// The Identity Brokering API v2 (POST .../token) calls this, from Keycloak
+	// 26.6; no @Override, so the class still compiles against 26.5. BankID
+	// gives no token to store, so the answer is the JSON error SAML's provider
+	// gives when it holds none.
+	public Response retrieveToken(KeycloakSession session, FederatedIdentityModel identity,
+			UserSessionModel userSession, UserModel user) {
+		return exchangeErrorResponse(session.getContext().getUri(), null, userSession,
+				"token_expired", "No token stored.");
 	}
 
 	@Override
