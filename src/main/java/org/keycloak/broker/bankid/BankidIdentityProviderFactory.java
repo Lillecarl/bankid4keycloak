@@ -3,6 +3,7 @@ package org.keycloak.broker.bankid;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.http.client.HttpClient;
 import org.keycloak.broker.bankid.client.SimpleBankidClient;
@@ -96,6 +97,11 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 		try {
 			return (new HttpClientBuilder()).keyStore(config.getKeyStore(), config.getPrivateKeyPassword())
 					.trustStore(config.getTrustStore())
+					// HttpClientBuilder waits forever by default; a stalled BankID
+					// call would hold a Keycloak worker thread with it.
+					.establishConnectionTimeout(5, TimeUnit.SECONDS)
+					.socketTimeout(10, TimeUnit.SECONDS)
+					.disableCookies(true)
 					.proxyMappings(generateProxyMapping())
 					.connectionPoolSize(config.getConnectionPoolSize())
 					.maxPooledPerRoute(config.getConnectionPoolPerRoute())
