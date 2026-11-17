@@ -12,6 +12,13 @@ function validateForm() {
 function startBankidLogin(spinnerOptions) {
 	const root = document.getElementById('bankid');
 	const query = 'state=' + encodeURIComponent(root.dataset.state);
+	// The BankID app returns to this page with #nonce=... after a same-device
+	// order; collect checks it against the session.
+	const returned = /(?:^#|&)nonce=([^&]+)/.exec(window.location.hash);
+	const collectQuery = returned === null ? query : query + '&nonce=' + encodeURIComponent(returned[1]);
+	if (returned !== null) {
+		history.replaceState(null, '', window.location.pathname + window.location.search);
+	}
 	const qrcode = document.getElementById('qrcode');
 	const qrcodeImg = document.getElementById('qrcode-img');
 	let frames = null;
@@ -47,7 +54,7 @@ function startBankidLogin(spinnerOptions) {
 	async function poll() {
 		let answer;
 		try {
-			const response = await fetch('collect?' + query, { cache: 'no-store' });
+			const response = await fetch('collect?' + collectQuery, { cache: 'no-store' });
 			answer = await response.json();
 		} catch (e) {
 			setTimeout(poll, 2000);
