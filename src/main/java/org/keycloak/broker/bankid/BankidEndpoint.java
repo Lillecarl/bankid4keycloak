@@ -3,6 +3,8 @@ package org.keycloak.broker.bankid;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.MessageDigest;
@@ -46,6 +48,7 @@ import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.CacheControl;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.Response.Status;
@@ -80,6 +83,7 @@ public class BankidEndpoint {
 
 	private static final Pattern PERSONAL_NUMBER_FORMAT = Pattern.compile("(19|20)[0-9]{10}");
 	private static final String QR_CODE_PREFIX = "bankid.";
+	private static final Pattern MOBILE_USER_AGENT = Pattern.compile("Android|iPhone|iPad|iPod|Mobile");
 	private static final int QR_CODE_SIZE = 246;
 
 	private final BankidIdentityProviderConfig config;
@@ -159,12 +163,59 @@ public class BankidEndpoint {
 		if (nin != null) {
 			authSession.setAuthNote(PERSONAL_NUMBER, nin);
 		}
+		return Response.seeOther(endpointUri("wait", state)).build();
+	}
+
+	/**
+	 * The page of a running order. /start and /login redirect here after they
+	 * create the order, so a reload shows the order again instead of
+	 * creating a new one.
+	 */
+	@GET
+	@Path("/wait")
+	public Response waitPage(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null) {
+			return noSession();
+		}
+		if (authSession.getAuthNote(ORDER_REF) == null) {
+			return error(BankidHintCodes.internal);
+		}
 		return form(authSession)
 				.setAttribute("state", state)
-				.setAttribute("autoStartToken", authResponse.getAutoStartToken())
+				.setAttribute("openUrl", "open?state=" + URLEncoder.encode(state, StandardCharsets.UTF_8))
 				.setAttribute("showqr", config.isShowQRCode())
 				.setAttribute("ninRequired", config.isRequiredNin())
 				.createForm("login-bankid.ftl");
+	}
+
+	/**
+	 * Same device: starts the BankID app on the current order. A mobile
+	 * browser opens the app through its universal link, a desktop browser
+	 * through the bankid: scheme, as BankID's autostart guide says.
+	 */
+	@GET
+	@Path("/open")
+	public Response open(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null) {
+			return noSession();
+		}
+		String token = authSession.getAuthNote(AUTO_START_TOKEN);
+		if (token == null) {
+			return error(BankidHintCodes.internal);
+		}
+		String userAgent = session.getContext().getRequestHeaders().getHeaderString(HttpHeaders.USER_AGENT);
+		boolean mobile = userAgent != null && MOBILE_USER_AGENT.matcher(userAgent).find();
+		String launch = (mobile ? "https://app.bankid.com/" : "bankid:///") + "?autostarttoken="
+				+ URLEncoder.encode(token, StandardCharsets.UTF_8);
+		return Response.seeOther(URI.create(launch)).cacheControl(noStore()).build();
+	}
+
+	/** An absolute URL to another call of this endpoint, carrying the state. */
+	private URI endpointUri(String call, String state) {
+		return URI.create(session.getContext().getUri().getAbsolutePath().resolve(call) + "?state="
+				+ URLEncoder.encode(state, StandardCharsets.UTF_8));
 	}
 
 	/**
