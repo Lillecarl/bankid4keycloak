@@ -3,14 +3,17 @@ package org.keycloak.broker.bankid;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.net.IDN;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 import javax.crypto.Mac;
@@ -19,11 +22,13 @@ import javax.crypto.spec.SecretKeySpec;
 import org.jboss.logging.Logger;
 import org.keycloak.broker.bankid.client.BankidClientException;
 import org.keycloak.broker.bankid.client.SimpleBankidClient;
+import org.keycloak.broker.bankid.model.AuthRequest;
 import org.keycloak.broker.bankid.model.AuthResponse;
 import org.keycloak.broker.bankid.model.BankidHintCodes;
 import org.keycloak.broker.bankid.model.BankidUser;
 import org.keycloak.broker.bankid.model.CollectResponse;
 import org.keycloak.broker.bankid.model.CompletionData;
+import org.keycloak.broker.bankid.model.WebRequestData;
 import org.keycloak.broker.provider.BrokeredIdentityContext;
 import org.keycloak.broker.provider.UserAuthenticationIdentityProvider.AuthenticationCallback;
 import org.keycloak.broker.provider.util.IdentityBrokerState;
@@ -75,13 +80,16 @@ public class BankidEndpoint {
 	private static final String STARTED = NOTE + "started";
 	private static final String PERSONAL_NUMBER = NOTE + "personalNumber";
 	private static final String COMPLETION = NOTE + "completion";
+	private static final String RETURN_NONCE = NOTE + "returnNonce";
 	private static final String[] NOTES = { ORDER_REF, AUTO_START_TOKEN, QR_START_TOKEN, QR_START_SECRET, STARTED,
-			PERSONAL_NUMBER, COMPLETION };
+			PERSONAL_NUMBER, COMPLETION, RETURN_NONCE };
 
 	private static final Pattern PERSONAL_NUMBER_FORMAT = Pattern.compile("(19|20)[0-9]{10}");
 	private static final String QR_CODE_PREFIX = "bankid.";
+	private static final Pattern REFERRING_DOMAIN = Pattern.compile("[0-9a-z.-]+");
 	private static final Pattern MOBILE_USER_AGENT = Pattern.compile("Android|iPhone|iPad|iPod|Mobile");
 	private static final int QR_CODE_SIZE = 246;
+	private static final SecureRandom RANDOM = new SecureRandom();
 
 	private final BankidIdentityProviderConfig config;
 	private final AuthenticationCallback callback;
@@ -147,7 +155,13 @@ public class BankidEndpoint {
 		clear(authSession);
 		AuthResponse authResponse;
 		try {
-			authResponse = bankidClient.sendAuth(nin, session.getContext().getConnection().getRemoteAddr());
+			String nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes(32));
+			AuthRequest request = new AuthRequest(session.getContext().getConnection().getRemoteAddr());
+			request.setReturnUrl(endpointUri("wait", state) + "#nonce=" + nonce);
+			request.setReturnRisk(true);
+			request.setWeb(webRequestData());
+			authResponse = bankidClient.sendAuth(nin, request);
+			authSession.setAuthNote(RETURN_NONCE, nonce);
 		} catch (BankidClientException e) {
 			return error(e.getHintCode());
 		}
@@ -208,6 +222,29 @@ public class BankidEndpoint {
 		return Response.seeOther(URI.create(launch)).cacheControl(noStore()).build();
 	}
 
+	private static byte[] randomBytes(int length) {
+		byte[] bytes = new byte[length];
+		RANDOM.nextBytes(bytes);
+		return bytes;
+	}
+
+	/** What BankID's risk indication may know about the browser that starts the order. */
+	private WebRequestData webRequestData() {
+		WebRequestData web = new WebRequestData();
+		String host = session.getContext().getUri().getBaseUri().getHost();
+		if (host != null) {
+			String domain = IDN.toASCII(host).toLowerCase(Locale.ROOT);
+			if (domain.length() >= 3 && REFERRING_DOMAIN.matcher(domain).matches()) {
+				web.setReferringDomain(domain);
+			}
+		}
+		String userAgent = session.getContext().getRequestHeaders().getHeaderString(HttpHeaders.USER_AGENT);
+		if (userAgent != null && !userAgent.isBlank()) {
+			web.setUserAgent(userAgent.length() > 512 ? userAgent.substring(0, 512) : userAgent);
+		}
+		return web.getReferringDomain() == null && web.getUserAgent() == null ? null : web;
+	}
+
 	/** An absolute URL to another call of this endpoint, carrying the state. */
 	private URI endpointUri(String call, String state) {
 		return URI.create(session.getContext().getUri().getAbsolutePath().resolve(call) + "?state="
@@ -220,9 +257,18 @@ public class BankidEndpoint {
 	 */
 	@GET
 	@Path("/collect")
-	public Response collect(@QueryParam("state") String state) {
+	public Response collect(@QueryParam("state") String state, @QueryParam("nonce") String nonce) {
 		AuthenticationSessionModel authSession = authSession(state);
 		if (authSession == null || authSession.getAuthNote(ORDER_REF) == null) {
+			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
+		}
+		// The page sends the nonce from the fragment of the return URL. One
+		// that differs from the session's is not BankID's return for this order.
+		if (nonce != null && !MessageDigest.isEqual(nonce.getBytes(StandardCharsets.US_ASCII),
+				String.valueOf(authSession.getAuthNote(RETURN_NONCE)).getBytes(StandardCharsets.US_ASCII))) {
+			logger.warnf("BankID: the return URL of order %s carries a wrong nonce", authSession.getAuthNote(ORDER_REF));
+			cancelRunning(authSession);
+			clear(authSession);
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
 		}
 		if (authSession.getAuthNote(COMPLETION) != null) {
@@ -248,6 +294,12 @@ public class BankidEndpoint {
 			if (!orderRef.equals(response.getOrderRef()) || personalNumber == null
 					|| (requested != null && !requested.equals(personalNumber))) {
 				logger.warnf("BankID: completed order %s does not match the order this login started", orderRef);
+				clear(authSession);
+				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
+			}
+			// BankID recommends cancelling an order it rates high risk.
+			if ("high".equals(completion.getRisk())) {
+				logger.warnf("BankID: order %s completed with high risk; refused", orderRef);
 				clear(authSession);
 				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
 			}
