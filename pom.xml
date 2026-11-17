@@ -14,7 +14,6 @@
 		<maven.compiler.target>${java.version}</maven.compiler.target>
 		<keycloak.version>26.5.6</keycloak.version>
 		<google.zxing.version>3.5.3</google.zxing.version>
-		<protostream.version>15.0.13.Final</protostream.version>
 	</properties>
 	<licenses>
 		<license>
@@ -49,12 +48,6 @@
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
-			<groupId>org.keycloak</groupId>
-			<artifactId>keycloak-model-infinispan</artifactId>
-			<version>${keycloak.version}</version>
-			<scope>provided</scope>
-		</dependency>
-		<dependency>
 			<groupId>org.apache.httpcomponents</groupId>
 			<artifactId>httpclient</artifactId>
 			<version>4.5.13</version>
@@ -76,19 +69,6 @@
 					<artifactId>jcommander</artifactId>
 				</exclusion>
 			</exclusions>
-		</dependency>
-		<!-- Protostream -->
-		<dependency>
-			<groupId>org.infinispan.protostream</groupId>
-			<artifactId>protostream-processor</artifactId>
-			<version>${protostream.version}</version>
-			<scope>provided</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.infinispan.protostream</groupId>
-			<artifactId>protostream</artifactId>
-			<version>${protostream.version}</version>
-			<scope>provided</scope>
 		</dependency>
 	</dependencies>
 	<build>

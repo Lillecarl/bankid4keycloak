@@ -1,83 +1,74 @@
-// for embedded scripts, quoted and modified from https://github.com/swansontec/rfc4648.js by William Swanson
 'use strict';
-function poll(fn, callback, errback, timeout, interval) {
-	    var endTime = Number(new Date()) + (timeout || 2000);
-	    interval = interval || 100;
 
-	    (function p() {
-	            // If the condition is met, we're done! 
-	            if(fn()) {
-	                callback();
-	            }
-	            // If the condition isn't met but the timeout hasn't elapsed, go again
-	            else if (Number(new Date()) < endTime) {
-	                setTimeout(p, interval);
-	            }
-	            // Didn't match and too much time, reject!
-	            else {
-	                errback(new Error('timed out for ' + fn + ': ' + arguments));
-	            }
-	    })();
-}
-
-function redirectToDone(bankidref, state) {
-	window.location.href = "done?bankidref=" + bankidref + "&state=" + state;
-}
-
-function redirectToError(errorCode) {
-    const stateVal = document.getElementById('state') ? document.getElementById('state').value : '';
-    window.location.href = "error?code=" + errorCode + "&state=" + stateVal;
-}
-
-function redirectToCancel(errorCode, bankidref) {
-    const stateVal = document.getElementById('state') ? document.getElementById('state').value : '';
-    window.location.href = "cancel?bankidref=" + bankidref + "&state=" + stateVal;
-}
-
-/* For login form */
+/* For the start form */
 function validateForm() {
-	let success = true;
 	let nin = document.getElementById('nin');
-	document.getElementById('error').style.display="none"; 
-	
-	if (nin == null) {
-		document.getElementById('error').style.display="inline"; 
-		return false;
-	}
-	
-	if (!/^[0-9]+$/.test(nin.value)) {
-		document.getElementById('error').style.display="inline"; 
-		success = false;
-	}
-	
-	if (nin.value.length != 12) {
-		document.getElementById('error').style.display="inline"; 
-		success = false;
-	}
-	
-	if (nin.value.charAt(0) !='1' && nin.value.charAt(0) !='2') {
-		document.getElementById('error').style.display="inline"; 
-		success = false;
-	}
-	return success;
+	let valid = nin !== null && /^(19|20)[0-9]{10}$/.test(nin.value);
+	document.getElementById('error').style.display = valid ? 'none' : 'inline';
+	return valid;
 }
 
-async function pollQrCode() {
-	const url='qrcode?bankidref=' + document.getElementById('bankidref').value;
-  await new Promise(r => setTimeout(r, 1000));
-	const req = window.XMLHttpRequest ? new XMLHttpRequest() : new ActiveXObject("Microsoft.XMLHTTP");
-  req.onloadend = (e) => {
-    if (req.readyState === 4 && req.status != 200) {
-      redirectToError("RFA5");
-    }
-    var urlCreator = window.URL || window.webkitURL;
-    var imageUrl = urlCreator.createObjectURL(req.response);
-    var oldUrl = document.querySelector("#qrcode-img").src; 
-    document.querySelector("#qrcode-img").src = imageUrl;
-    // FIXME: Clean up object URLs somehow, this does not seem to work
-    urlCreator.revokeObjectURL(oldUrl);
-  };
-	req.open("GET", url);
-  req.responseType = "blob";
-	req.send();
+/* For the login page: polls the order, and draws the QR code once a second. */
+function startBankidLogin(spinnerOptions) {
+	const root = document.getElementById('bankid');
+	const query = 'state=' + encodeURIComponent(root.dataset.state);
+	const qrcode = document.getElementById('qrcode');
+	const qrcodeImg = document.getElementById('qrcode-img');
+	let frames = null;
+
+	function frame() {
+		qrcodeImg.src = 'qrcode?' + query + '&t=' + Date.now();
+	}
+
+	function stopFrames() {
+		if (frames !== null) {
+			clearInterval(frames);
+			frames = null;
+		}
+	}
+
+	function redirectToError(hintCode) {
+		stopFrames();
+		window.location.href = 'error?code=' + encodeURIComponent(hintCode || '') + '&' + query;
+	}
+
+	function showProgress() {
+		stopFrames();
+		if (qrcode !== null) {
+			qrcode.style.display = 'none';
+		}
+		const loading = document.getElementById('loading');
+		if (loading.style.display !== 'flex') {
+			loading.style.display = 'flex';
+			new Spin.Spinner(spinnerOptions).spin(document.getElementById('progress-loader'));
+		}
+	}
+
+	async function poll() {
+		let answer;
+		try {
+			const response = await fetch('collect?' + query, { cache: 'no-store' });
+			answer = await response.json();
+		} catch (e) {
+			setTimeout(poll, 2000);
+			return;
+		}
+		if (answer.status === 'complete') {
+			stopFrames();
+			window.location.href = 'done?' + query;
+		} else if (answer.status === 'pending') {
+			if (answer.hintCode === 'started' || answer.hintCode === 'userSign') {
+				showProgress();
+			}
+			setTimeout(poll, 2000);
+		} else {
+			redirectToError(answer.hintCode);
+		}
+	}
+
+	if (qrcodeImg !== null) {
+		frame();
+		frames = setInterval(frame, 1000);
+	}
+	poll();
 }
