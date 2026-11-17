@@ -19,6 +19,11 @@ import org.keycloak.models.UserSessionModel;
 
 public class BankidIdentityProvider extends AbstractIdentityProvider<BankidIdentityProviderConfig> {
 
+	/** User attributes written when the username is a pseudonym; the names match the Freja eID provider's. */
+	public static final String ATTR_PERSONAL_NUMBER = "personalIdentityNumber";
+	public static final String ATTR_PERSONAL_NUMBER_COUNTRY = "personalIdentityNumberCountry";
+	static final String CONTEXT_PERSONAL_NUMBER = "bankid.personalIdentityNumber";
+
 	private final SimpleBankidClient bankidClient;
 
 	public BankidIdentityProvider(KeycloakSession session, BankidIdentityProviderConfig config,
@@ -79,10 +84,27 @@ public class BankidIdentityProvider extends AbstractIdentityProvider<BankidIdent
 			String key = entry.getKey();
 			// Add the value to the user session notes if key starts with provider config
 			// alias since it means it was added by the BankidEndpoint
-			if (key.startsWith(this.getConfig().getAlias())) {
+			// The personal number goes to the user attribute only, never into a
+			// session note, even when the alias is a prefix of its key.
+			if (key.startsWith(this.getConfig().getAlias()) && !CONTEXT_PERSONAL_NUMBER.equals(key)) {
 				Object value = entry.getValue();
 				context.getAuthenticationSession().setUserSessionNote(key, value.toString());
 			}
+		}
+		writeAttributes(user, context);
+	}
+
+	@Override
+	public void updateBrokeredUser(KeycloakSession session, RealmModel realm, UserModel user,
+			BrokeredIdentityContext context) {
+		writeAttributes(user, context);
+	}
+
+	private static void writeAttributes(UserModel user, BrokeredIdentityContext context) {
+		Object personalNumber = context.getContextData().get(CONTEXT_PERSONAL_NUMBER);
+		if (personalNumber != null) {
+			user.setSingleAttribute(ATTR_PERSONAL_NUMBER, personalNumber.toString());
+			user.setSingleAttribute(ATTR_PERSONAL_NUMBER_COUNTRY, "SE");
 		}
 	}
 
