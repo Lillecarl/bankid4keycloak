@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +23,7 @@ import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.provider.ProviderConfigProperty;
 import org.keycloak.provider.ProviderConfigurationBuilder;
+import org.keycloak.vault.VaultStringSecret;
 
 public class BankidIdentityProviderFactory extends AbstractIdentityProviderFactory	<BankidIdentityProvider> {
 
@@ -42,20 +44,46 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 	@Override
 	public BankidIdentityProvider create(KeycloakSession session, IdentityProviderModel model) {
 		BankidIdentityProviderConfig config = new BankidIdentityProviderConfig(model);
+		BankidIdentityProviderConfig resolved = withVaultSecrets(session, config);
 		String alias = config.getAlias() != null ? config.getAlias() : "";
-		String version = version(config);
+		String version = version(resolved);
 		Loaded loaded = CLIENTS.compute(alias, (key, current) -> {
 			if (current != null && current.version().equals(version)) {
 				return current;
 			}
 			Loaded fresh = new Loaded(version,
-					new SimpleBankidClient(buildBankidHttpClient(config), config.getApiUrl()));
+					new SimpleBankidClient(buildBankidHttpClient(resolved), config.getApiUrl()));
 			if (current != null) {
 				current.client().close();
 			}
 			return fresh;
 		});
 		return new BankidIdentityProvider(session, config, loaded.client());
+	}
+
+	/**
+	 * A copy of the configuration with each password resolved through
+	 * Keycloak's vault, so a password can be a {@code ${vault.<key>}}
+	 * reference instead of plain text in the realm. A value that is not a
+	 * vault reference passes through unchanged.
+	 */
+	private static BankidIdentityProviderConfig withVaultSecrets(KeycloakSession session,
+			BankidIdentityProviderConfig config) {
+		BankidIdentityProviderConfig resolved = new BankidIdentityProviderConfig(config);
+		Map<String, String> values = new HashMap<>(config.getConfig());
+		for (String property : new String[] { BankidIdentityProviderConfig.BANKID_KEYSTORE_PASSWORD_PROPERTY_NAME,
+				BankidIdentityProviderConfig.BANKID_PRIVATEKEY_PASSWORD_PROPERTY_NAME,
+				BankidIdentityProviderConfig.BANKID_TRUSTSTORE_PASSWORD_PROPERTY_NAME }) {
+			String value = values.get(property);
+			if (value != null) {
+				try (VaultStringSecret secret = session.vault().getStringSecret(value)) {
+					values.put(property, secret.get().orElseThrow(
+							() -> new IllegalStateException("BankID: the vault has no secret for " + property)));
+				}
+			}
+		}
+		resolved.setConfig(values);
+		return resolved;
 	}
 
 	/**
@@ -102,16 +130,16 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 				.property().name(BankidIdentityProviderConfig.BANKID_KEYSTORE_FILE_PROPERTY_NAME).label("Keystore file").helpText("Full path to the keystore file, that holds the client certificate, including filename i.e. /path/to/file/myfile.p12")
                 .type(ProviderConfigProperty.STRING_TYPE).add()
 				
-				.property().name(BankidIdentityProviderConfig.BANKID_KEYSTORE_PASSWORD_PROPERTY_NAME).label("Keystore password").helpText("The password for the keystore.")
+				.property().name(BankidIdentityProviderConfig.BANKID_KEYSTORE_PASSWORD_PROPERTY_NAME).label("Keystore password").helpText("The password for the keystore. A ${vault.<key>} reference reads it from Keycloak's vault.")
                 .type(ProviderConfigProperty.PASSWORD).add()
 				
-				.property().name(BankidIdentityProviderConfig.BANKID_PRIVATEKEY_PASSWORD_PROPERTY_NAME).label("Password for the private key").helpText("Password for the private key.")
+				.property().name(BankidIdentityProviderConfig.BANKID_PRIVATEKEY_PASSWORD_PROPERTY_NAME).label("Password for the private key").helpText("Password for the private key. A ${vault.<key>} reference reads it from Keycloak's vault.")
                 .type(ProviderConfigProperty.PASSWORD).add()
 				
 				.property().name(BankidIdentityProviderConfig.BANKID_TRUSTSTORE_FILE_PROPERTY_NAME).label("Truststore file").helpText("Full path to the truststore file, that holds the CA for the server certificate, including filename i.e. /path/to/file/bankid-truststore.p12")
                 .type(ProviderConfigProperty.STRING_TYPE).add()
 				
-				.property().name(BankidIdentityProviderConfig.BANKID_TRUSTSTORE_PASSWORD_PROPERTY_NAME).label("Truststore password").helpText("The password for the truststore.")
+				.property().name(BankidIdentityProviderConfig.BANKID_TRUSTSTORE_PASSWORD_PROPERTY_NAME).label("Truststore password").helpText("The password for the truststore. A ${vault.<key>} reference reads it from Keycloak's vault.")
                 .type(ProviderConfigProperty.PASSWORD).add()
 				
 				.property().name(BankidIdentityProviderConfig.BANKID_REQUIRE_NIN).label("Require Personal Number").helpText("Require the user to provide their Personal Number before logging in.")
