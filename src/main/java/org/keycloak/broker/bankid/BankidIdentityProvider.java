@@ -15,6 +15,7 @@ import org.keycloak.models.FederatedIdentityModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserSessionModel;
 
 public class BankidIdentityProvider extends AbstractIdentityProvider<BankidIdentityProviderConfig> {
 
@@ -49,6 +50,13 @@ public class BankidIdentityProvider extends AbstractIdentityProvider<BankidIdent
 	@Override
 	public Response retrieveToken(KeycloakSession session, FederatedIdentityModel identity) {
 		return Response.ok(identity.getToken()).build();
+	}
+
+	// Abstract in Keycloak 26.8; no @Override, so the class still compiles
+	// against releases that lack it.
+	public Response retrieveToken(KeycloakSession session, FederatedIdentityModel identity,
+			UserSessionModel userSession, UserModel user) {
+		return retrieveToken(session, identity);
 	}
 
 	@Override
