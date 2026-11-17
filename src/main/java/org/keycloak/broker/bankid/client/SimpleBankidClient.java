@@ -138,7 +138,7 @@ public class SimpleBankidClient {
 					path,
 					response.getStatus(),
 					responseJson.toString());
-			throw new BankidClientException(BankidHintCodes.valueOf(responseJson.get("errorCode").textValue()));
+			throw new BankidClientException(BankidHintCodes.of(responseJson.path("errorCode").asText(null)));
 		} catch (IOException e) {
 			throw new BankidClientException(BankidHintCodes.internal);
 		}
