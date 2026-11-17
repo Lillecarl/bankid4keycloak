@@ -81,8 +81,12 @@ public class BankidEndpoint {
 	private static final String PERSONAL_NUMBER = NOTE + "personalNumber";
 	private static final String COMPLETION = NOTE + "completion";
 	private static final String RETURN_NONCE = NOTE + "returnNonce";
+	private static final String WINDOW = NOTE + "window";
 	private static final String[] NOTES = { ORDER_REF, AUTO_START_TOKEN, QR_START_TOKEN, QR_START_SECRET, STARTED,
-			PERSONAL_NUMBER, COMPLETION, RETURN_NONCE };
+			PERSONAL_NUMBER, COMPLETION, RETURN_NONCE, WINDOW };
+	// BankID's accessibility guidance: at least five minutes to scan, with a
+	// countdown and a way to extend it.
+	private static final long WINDOW_SECONDS = 300;
 
 	private static final Pattern PERSONAL_NUMBER_FORMAT = Pattern.compile("(19|20)[0-9]{10}");
 	private static final String QR_CODE_PREFIX = "bankid.";
@@ -153,27 +157,70 @@ public class BankidEndpoint {
 	private Response doLogin(AuthenticationSessionModel authSession, String nin, String state) {
 		cancelRunning(authSession);
 		clear(authSession);
-		AuthResponse authResponse;
 		try {
-			String nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes(32));
-			AuthRequest request = new AuthRequest(session.getContext().getConnection().getRemoteAddr());
-			request.setReturnUrl(endpointUri("wait", state) + "#nonce=" + nonce);
-			request.setReturnRisk(true);
-			request.setWeb(webRequestData());
-			authResponse = bankidClient.sendAuth(nin, request);
-			authSession.setAuthNote(RETURN_NONCE, nonce);
+			begin(authSession, nin, state, now());
 		} catch (BankidClientException e) {
 			return error(e.getHintCode());
 		}
+		return Response.seeOther(endpointUri("wait", state)).build();
+	}
+
+	/**
+	 * Creates an order and keeps it in the session. The window is when the
+	 * page's time limit started: a renewed order keeps it, a new login or an
+	 * extension starts a new one.
+	 */
+	private void begin(AuthenticationSessionModel authSession, String nin, String state, long window) {
+		String nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes(32));
+		AuthRequest request = new AuthRequest(session.getContext().getConnection().getRemoteAddr());
+		request.setReturnUrl(endpointUri("wait", state) + "#nonce=" + nonce);
+		request.setReturnRisk(true);
+		request.setWeb(webRequestData());
+		AuthResponse authResponse = bankidClient.sendAuth(nin, request);
+		clear(authSession);
+		authSession.setAuthNote(RETURN_NONCE, nonce);
 		authSession.setAuthNote(ORDER_REF, authResponse.getOrderRef());
 		authSession.setAuthNote(AUTO_START_TOKEN, authResponse.getAutoStartToken());
 		authSession.setAuthNote(QR_START_TOKEN, authResponse.getQrStartToken());
 		authSession.setAuthNote(QR_START_SECRET, authResponse.getQrStartSecret());
 		authSession.setAuthNote(STARTED, Long.toString(authResponse.getAuthTimestamp()));
+		authSession.setAuthNote(WINDOW, Long.toString(window));
 		if (nin != null) {
 			authSession.setAuthNote(PERSONAL_NUMBER, nin);
 		}
-		return Response.seeOther(endpointUri("wait", state)).build();
+	}
+
+	/** Seconds left of the page's time limit. */
+	private static long remaining(AuthenticationSessionModel authSession) {
+		String window = authSession.getAuthNote(WINDOW);
+		return window == null ? 0 : Math.max(0, Long.parseLong(window) + WINDOW_SECONDS - now());
+	}
+
+	private static long now() {
+		return Instant.now().getEpochSecond();
+	}
+
+	/**
+	 * Starts a new order and a new time limit, for the page's extend button.
+	 * Only while no order is under way in the app.
+	 */
+	@POST
+	@Path("/extend")
+	public Response extend(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null || authSession.getAuthNote(ORDER_REF) == null
+				|| authSession.getAuthNote(COMPLETION) != null) {
+			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name(), 0);
+		}
+		cancelRunning(authSession);
+		try {
+			begin(authSession, authSession.getAuthNote(PERSONAL_NUMBER), state, now());
+		} catch (BankidClientException e) {
+			clear(authSession);
+			return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name(), 0);
+		}
+		return collectAnswer(Status.OK, "pending", BankidHintCodes.outstandingTransaction.name(),
+				remaining(authSession));
 	}
 
 	/**
@@ -283,8 +330,32 @@ public class BankidEndpoint {
 			return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name());
 		}
 		String status = response.getStatus();
+		String hint = response.getHintCode();
+		boolean unscanned = "outstandingTransaction".equals(hint) || "noClient".equals(hint);
+		if ("pending".equals(status) && unscanned && remaining(authSession) == 0) {
+			cancelRunning(authSession);
+			clear(authSession);
+			return collectAnswer(Status.OK, "expired", hint, 0);
+		}
 		if ("pending".equals(status)) {
-			return collectAnswer(Status.OK, "pending", response.getHintCode());
+			return collectAnswer(Status.OK, "pending", hint, remaining(authSession));
+		}
+		if ("failed".equals(status) && "startFailed".equals(hint) && remaining(authSession) == 0) {
+			clear(authSession);
+			return collectAnswer(Status.OK, "expired", hint, 0);
+		}
+		// An order nobody started lives 30 seconds. Until the page's time
+		// limit runs out, a new order replaces it, as BankID's QR guide says.
+		if ("failed".equals(status) && "startFailed".equals(hint) && remaining(authSession) > 0) {
+			try {
+				begin(authSession, authSession.getAuthNote(PERSONAL_NUMBER), state,
+						Long.parseLong(authSession.getAuthNote(WINDOW)));
+			} catch (BankidClientException e) {
+				clear(authSession);
+				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name(), 0);
+			}
+			return collectAnswer(Status.OK, "pending", BankidHintCodes.outstandingTransaction.name(),
+					remaining(authSession));
 		}
 		if ("complete".equals(status)) {
 			CompletionData completion = response.getCompletionData();
@@ -492,9 +563,14 @@ public class BankidEndpoint {
 	}
 
 	private static Response collectAnswer(Status httpStatus, String status, String hintCode) {
+		return collectAnswer(httpStatus, status, hintCode, 0);
+	}
+
+	private static Response collectAnswer(Status httpStatus, String status, String hintCode, long remaining) {
 		String body = JsonSerialization.mapper.createObjectNode()
 				.put("status", status)
 				.put("hintCode", hintCode)
+				.put("remaining", remaining)
 				.toString();
 		return Response.status(httpStatus).entity(body).type(MediaType.APPLICATION_JSON_TYPE)
 				.cacheControl(noStore()).build();
