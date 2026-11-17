@@ -1,5 +1,6 @@
 package org.keycloak.broker.bankid.client;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
@@ -32,6 +33,16 @@ public class SimpleBankidClient {
 	public SimpleBankidClient(HttpClient bankidHttpClient, String baseUrl) {
 		this.bankidHttpClient = bankidHttpClient;
 		this.baseUrl = baseUrl;
+	}
+
+	public void close() {
+		if (bankidHttpClient instanceof Closeable closeable) {
+			try {
+				closeable.close();
+			} catch (IOException e) {
+				logger.warn("Failed to close the BankID HTTP client", e);
+			}
+		}
 	}
 
 	public AuthResponse sendAuth(String personalNumber, String endUserIp) {

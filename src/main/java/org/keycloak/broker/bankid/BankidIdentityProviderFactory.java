@@ -1,7 +1,15 @@
 package org.keycloak.broker.bankid;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
@@ -18,8 +26,14 @@ import org.keycloak.provider.ProviderConfigurationBuilder;
 public class BankidIdentityProviderFactory extends AbstractIdentityProviderFactory	<BankidIdentityProvider> {
 
 	public static final String PROVIDER_ID = "bankid";
-	private static final Map<String, SimpleBankidClient> CLIENTS = new ConcurrentHashMap<>();
-	
+
+	/** A client and the configuration it was built from. */
+	private record Loaded(String version, SimpleBankidClient client) {
+	}
+
+	/** One pooled client per identity provider, rebuilt when its configuration or key stores change. */
+	private static final Map<String, Loaded> CLIENTS = new ConcurrentHashMap<>();
+
 	@Override
 	public String getName() {
 		return "BankID e-legitimation";
@@ -28,9 +42,46 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 	@Override
 	public BankidIdentityProvider create(KeycloakSession session, IdentityProviderModel model) {
 		BankidIdentityProviderConfig config = new BankidIdentityProviderConfig(model);
-		SimpleBankidClient client = CLIENTS.computeIfAbsent(clientKey(config),
-				key -> new SimpleBankidClient(buildBankidHttpClient(config), config.getApiUrl()));
-		return new BankidIdentityProvider(session, config, client);
+		// The internal id is unique across realms; an alias is unique only inside one.
+		String id = model.getInternalId() != null ? model.getInternalId() : String.valueOf(config.getAlias());
+		String version = version(config);
+		Loaded loaded = CLIENTS.compute(id, (key, current) -> {
+			if (current != null && current.version().equals(version)) {
+				return current;
+			}
+			Loaded fresh = new Loaded(version,
+					new SimpleBankidClient(buildBankidHttpClient(config), config.getApiUrl()));
+			if (current != null) {
+				current.client().close();
+			}
+			return fresh;
+		});
+		return new BankidIdentityProvider(session, config, loaded.client());
+	}
+
+	/**
+	 * Names everything the client is built from: the provider configuration,
+	 * and the modification times of the key store files, so that a renewed
+	 * certificate at the same path takes effect without a restart.
+	 */
+	private static String version(BankidIdentityProviderConfig config) {
+		try {
+			MessageDigest digest = MessageDigest.getInstance("SHA-256");
+			for (Map.Entry<String, String> entry : new TreeMap<>(config.getConfig()).entrySet()) {
+				digest.update((entry.getKey() + "=" + entry.getValue() + "\n").getBytes(StandardCharsets.UTF_8));
+			}
+			for (String property : new String[] { BankidIdentityProviderConfig.BANKID_KEYSTORE_FILE_PROPERTY_NAME,
+					BankidIdentityProviderConfig.BANKID_TRUSTSTORE_FILE_PROPERTY_NAME }) {
+				String file = config.getConfig().get(property);
+				String modified = file == null ? "" : Files.getLastModifiedTime(Path.of(file)).toString();
+				digest.update((property + "@" + modified + "\n").getBytes(StandardCharsets.UTF_8));
+			}
+			return HexFormat.of().formatHex(digest.digest());
+		} catch (IOException e) {
+			throw new IllegalStateException("BankID: cannot read the key store files", e);
+		} catch (NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
+		}
 	}
 
 	@Override
@@ -85,12 +136,6 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 		.type(ProviderConfigProperty.STRING_TYPE).add()
 
 			.build();
-	}
-
-	private String clientKey(BankidIdentityProviderConfig config) {
-		String alias = config.getAlias() != null ? config.getAlias() : "";
-		String apiUrl = config.getApiUrl() != null ? config.getApiUrl() : "";
-		return alias + "@" + apiUrl;
 	}
 
 	private HttpClient buildBankidHttpClient(BankidIdentityProviderConfig config) {
