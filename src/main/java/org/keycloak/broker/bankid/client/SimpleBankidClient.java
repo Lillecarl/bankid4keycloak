@@ -89,6 +89,9 @@ public class SimpleBankidClient {
 			request.setHeader(HttpHeaders.ACCEPT, "application/json");
 
 			Response response = new Response(this.bankidHttpClient.execute(request), MAX_CONSUMED_RESPONSE_SIZE);
+			// Reading the body returns the connection to the pool. A caller that
+			// ignores the response, as sendCancel does, would otherwise hold it.
+			response.asString();
 
 			switch (response.getStatus()) {
 				case 200:
