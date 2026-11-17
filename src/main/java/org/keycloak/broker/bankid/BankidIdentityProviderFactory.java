@@ -33,7 +33,7 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 	private record Loaded(String version, SimpleBankidClient client) {
 	}
 
-	/** One pooled client per identity provider alias, rebuilt when its configuration or key stores change. */
+	/** One pooled client per identity provider, rebuilt when its configuration or key stores change. */
 	private static final Map<String, Loaded> CLIENTS = new ConcurrentHashMap<>();
 
 	@Override
@@ -45,9 +45,10 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 	public BankidIdentityProvider create(KeycloakSession session, IdentityProviderModel model) {
 		BankidIdentityProviderConfig config = new BankidIdentityProviderConfig(model);
 		BankidIdentityProviderConfig resolved = withVaultSecrets(session, config);
-		String alias = config.getAlias() != null ? config.getAlias() : "";
+		// The internal id is unique across realms; an alias is unique only inside one.
+		String id = model.getInternalId() != null ? model.getInternalId() : String.valueOf(config.getAlias());
 		String version = version(resolved);
-		Loaded loaded = CLIENTS.compute(alias, (key, current) -> {
+		Loaded loaded = CLIENTS.compute(id, (key, current) -> {
 			if (current != null && current.version().equals(version)) {
 				return current;
 			}
