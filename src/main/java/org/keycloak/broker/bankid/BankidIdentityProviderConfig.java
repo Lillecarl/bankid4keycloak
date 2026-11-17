@@ -23,8 +23,8 @@ public class BankidIdentityProviderConfig extends IdentityProviderModel {
 	public static final String BANKID_CONNECTION_POOL_SIZE = "bankid_connection_pool_size";
 	public static final String BANKID_MAX_POOLED_PER_ROUTE = "bankid_max_pooled_per_route";
 
-	private KeyStore keyStore;
-	private KeyStore truststore;
+	private transient KeyStore keyStore;
+	private transient KeyStore truststore;
 
 	public BankidIdentityProviderConfig() {
 		super();
