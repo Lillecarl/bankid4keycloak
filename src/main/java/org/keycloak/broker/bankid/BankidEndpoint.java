@@ -80,6 +80,10 @@ public class BankidEndpoint {
 	private static final String STARTED = NOTE + "started";
 	private static final String PERSONAL_NUMBER = NOTE + "personalNumber";
 	private static final String COMPLETION = NOTE + "completion";
+	// Set by /open: the autostart token left the server.
+	private static final String SAME_DEVICE = NOTE + "sameDevice";
+	// Set by a collect that carries the return URL's nonce.
+	private static final String RETURNED = NOTE + "returned";
 	// The alias of the provider that started the order. The other notes are
 	// shared by every BankID provider of the realm.
 	private static final String PROVIDER = NOTE + "provider";
@@ -223,6 +227,7 @@ public class BankidEndpoint {
 		boolean mobile = userAgent != null && MOBILE_USER_AGENT.matcher(userAgent).find();
 		String launch = (mobile ? "https://app.bankid.com/" : "bankid:///") + "?autostarttoken="
 				+ URLEncoder.encode(token, StandardCharsets.UTF_8);
+		authSession.setAuthNote(SAME_DEVICE, "true");
 		return Response.seeOther(URI.create(launch)).cacheControl(noStore()).build();
 	}
 
@@ -278,8 +283,11 @@ public class BankidEndpoint {
 			clear(authSession);
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
 		}
+		if (nonce != null) {
+			authSession.setAuthNote(RETURNED, "true");
+		}
 		if (authSession.getAuthNote(COMPLETION) != null) {
-			return collectAnswer(Status.OK, "complete", null);
+			return completeAnswer(authSession);
 		}
 		String orderRef = authSession.getAuthNote(ORDER_REF);
 		CollectResponse response;
@@ -316,7 +324,7 @@ public class BankidEndpoint {
 				clear(authSession);
 				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
 			}
-			return collectAnswer(Status.OK, "complete", null);
+			return completeAnswer(authSession);
 		}
 		clear(authSession);
 		return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", response.getHintCode());
@@ -329,8 +337,9 @@ public class BankidEndpoint {
 		session.getContext().setAuthenticationSession(authSession);
 		String stored = authSession.getAuthNote(COMPLETION);
 		boolean startedHere = startedHere(authSession);
+		boolean returned = returned(authSession);
 		clear(authSession);
-		if (stored == null || !startedHere) {
+		if (stored == null || !startedHere || !returned) {
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
 		}
 		CompletionData completionData;
@@ -469,6 +478,31 @@ public class BankidEndpoint {
 			authSession.removeAuthNote(note);
 		}
 		authSession.removeAuthNote(PROVIDER);
+		authSession.removeAuthNote(SAME_DEVICE);
+		authSession.removeAuthNote(RETURNED);
+	}
+
+	/**
+	 * Whether the browser that holds the session came back through the return
+	 * URL, when the order was started on this device. /open reveals the
+	 * autostart token, and the token in someone else's app completes the
+	 * order; only the device that signed receives the return URL's nonce.
+	 * BankID's auth reference: verify "that the device receiving the
+	 * returnUrl is the same device that started the order".
+	 */
+	private static boolean returned(AuthenticationSessionModel authSession) {
+		return authSession.getAuthNote(SAME_DEVICE) == null || authSession.getAuthNote(RETURNED) != null;
+	}
+
+	/**
+	 * A complete order, or a pending one while the app has not yet returned
+	 * this browser through the return URL.
+	 */
+	private Response completeAnswer(AuthenticationSessionModel authSession) {
+		if (!returned(authSession)) {
+			return collectAnswer(Status.OK, "pending", "userSign");
+		}
+		return collectAnswer(Status.OK, "complete", null);
 	}
 
 	/**
