@@ -13,6 +13,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.Locale;
 import java.util.regex.Pattern;
 
@@ -41,6 +42,7 @@ import org.keycloak.services.managers.AuthenticationSessionManager;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
 import org.keycloak.util.JsonSerialization;
+import org.keycloak.vault.VaultStringSecret;
 
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.client.j2se.MatrixToImageWriter;
@@ -333,6 +335,20 @@ public class BankidEndpoint {
 	@GET
 	@Path("/done")
 	public Response done(@QueryParam("state") String state) {
+		// Before the state is verified, which consumes its session code: a
+		// failure after that leaves the user no page to retry from.
+		String secret;
+		try {
+			secret = pseudonymSecret();
+		} catch (IllegalStateException e) {
+			logger.error("BankID: cannot read the pseudonym secret", e);
+			AuthenticationSessionModel current = authSession(state);
+			if (current == null) {
+				return noSession();
+			}
+			session.getContext().setAuthenticationSession(current);
+			return error(BankidHintCodes.internal);
+		}
 		AuthenticationSessionModel authSession = callback.getAndVerifyAuthenticationSession(state);
 		session.getContext().setAuthenticationSession(authSession);
 		String stored = authSession.getAuthNote(COMPLETION);
@@ -346,7 +362,7 @@ public class BankidEndpoint {
 		String username;
 		try {
 			completionData = JsonSerialization.readValue(stored, CompletionData.class);
-			username = getUsername(completionData.getUser());
+			username = getUsername(completionData.getUser(), secret);
 		} catch (IOException | NoSuchAlgorithmException e) {
 			logger.error("BankID: cannot read the completed order", e);
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
@@ -359,6 +375,10 @@ public class BankidEndpoint {
 		identity.setUsername(username);
 		identity.setFirstName(user.getGivenName());
 		identity.setLastName(user.getSurname());
+		if (secret != null) {
+			// Kept on the user, for an admin, instead of in the username.
+			identity.getContextData().put(BankidIdentityProvider.CONTEXT_PERSONAL_NUMBER, user.getPersonalNumber());
+		}
 
 		setUserSessionNote(authSession, ".pnr", username);
 		setUserSessionNote(authSession, ".issuedate", completionData.getBankIdIssueDate());
@@ -377,13 +397,39 @@ public class BankidEndpoint {
 		}
 	}
 
-	private String getUsername(BankidUser user) throws NoSuchAlgorithmException {
+	/**
+	 * The username, which is also the federated id. With a pseudonym secret it
+	 * is HMAC-SHA256(secret, personal number) in hex: stable, and not
+	 * reversible without the secret. The unkeyed hash is reversible: there
+	 * are only a few tens of millions of personal numbers.
+	 */
+	private String getUsername(BankidUser user, String secret) throws NoSuchAlgorithmException {
+		if (secret != null) {
+			try {
+				Mac mac = Mac.getInstance("HmacSHA256");
+				mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+				return HexFormat.of().formatHex(mac.doFinal(user.getPersonalNumber().getBytes(StandardCharsets.UTF_8)));
+			} catch (InvalidKeyException e) {
+				throw new IllegalStateException("BankID: unusable pseudonym secret", e);
+			}
+		}
 		if (this.config.isSaveNinHashed()) {
 			MessageDigest md = MessageDigest.getInstance("SHA-256");
 			md.update(user.getPersonalNumber().getBytes(StandardCharsets.UTF_8));
 			return Base64.getEncoder().encodeToString(md.digest());
 		} else {
 			return user.getPersonalNumber();
+		}
+	}
+
+	private String pseudonymSecret() {
+		String value = config.getPseudonymSecret();
+		if (value == null || value.isEmpty()) {
+			return null;
+		}
+		try (VaultStringSecret secret = session.vault().getStringSecret(value)) {
+			return secret.get().orElseThrow(
+					() -> new IllegalStateException("BankID: the vault has no secret for the pseudonym"));
 		}
 	}
 

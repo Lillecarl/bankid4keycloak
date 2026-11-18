@@ -71,9 +71,12 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 				.defaultValue(true)
                 .type(ProviderConfigProperty.BOOLEAN_TYPE).add()
 
-				.property().name(BankidIdentityProviderConfig.BANKID_SAVE_NIN_HASH).label("Use hashed Personal Number").helpText("Used hashed (SHA-256) Personal Number in keycloak instead of storing it in clear text.")
+				.property().name(BankidIdentityProviderConfig.BANKID_SAVE_NIN_HASH).label("Use hashed Personal Number").helpText("Use an unkeyed SHA-256 of the Personal Number as the username. Anyone can reverse it, since there are few Personal Numbers; prefer the pseudonym secret.")
 				.defaultValue(false)
 				.type(ProviderConfigProperty.BOOLEAN_TYPE).add()
+
+		.property().name(BankidIdentityProviderConfig.BANKID_PSEUDONYM_SECRET).label("Pseudonym secret").helpText("When set, the username and federated id are HMAC-SHA256 of the Personal Number under this secret, and the Personal Number goes to the personalIdentityNumber user attribute. Declare that attribute in the user profile as editable by admins only. Setting, changing or removing the secret changes every user's id, so returning users go through first broker login again. A ${vault.<key>} reference reads it from Keycloak's vault.")
+		.type(ProviderConfigProperty.PASSWORD).add()
 
 		.property().name(BankidIdentityProviderConfig.BANKID_CONNECTION_POOL_SIZE).label("Connection pool size").helpText("Total HTTP connections available for BankID calls.")
 		.defaultValue("200")
