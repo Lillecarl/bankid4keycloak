@@ -3,12 +3,17 @@ package org.keycloak.broker.bankid;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.net.IDN;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 import javax.crypto.Mac;
@@ -17,11 +22,13 @@ import javax.crypto.spec.SecretKeySpec;
 import org.jboss.logging.Logger;
 import org.keycloak.broker.bankid.client.BankidClientException;
 import org.keycloak.broker.bankid.client.SimpleBankidClient;
+import org.keycloak.broker.bankid.model.AuthRequest;
 import org.keycloak.broker.bankid.model.AuthResponse;
 import org.keycloak.broker.bankid.model.BankidHintCodes;
 import org.keycloak.broker.bankid.model.BankidUser;
 import org.keycloak.broker.bankid.model.CollectResponse;
 import org.keycloak.broker.bankid.model.CompletionData;
+import org.keycloak.broker.bankid.model.WebRequestData;
 import org.keycloak.broker.provider.BrokeredIdentityContext;
 import org.keycloak.broker.provider.UserAuthenticationIdentityProvider.AuthenticationCallback;
 import org.keycloak.broker.provider.util.IdentityBrokerState;
@@ -46,6 +53,7 @@ import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.CacheControl;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.Response.Status;
@@ -72,15 +80,23 @@ public class BankidEndpoint {
 	private static final String STARTED = NOTE + "started";
 	private static final String PERSONAL_NUMBER = NOTE + "personalNumber";
 	private static final String COMPLETION = NOTE + "completion";
+	// Set by /open: the autostart token left the server.
+	private static final String SAME_DEVICE = NOTE + "sameDevice";
+	// Set by a collect that carries the return URL's nonce.
+	private static final String RETURNED = NOTE + "returned";
 	// The alias of the provider that started the order. The other notes are
 	// shared by every BankID provider of the realm.
 	private static final String PROVIDER = NOTE + "provider";
+	private static final String RETURN_NONCE = NOTE + "returnNonce";
 	private static final String[] NOTES = { ORDER_REF, AUTO_START_TOKEN, QR_START_TOKEN, QR_START_SECRET, STARTED,
-			PERSONAL_NUMBER, COMPLETION };
+			PERSONAL_NUMBER, COMPLETION, RETURN_NONCE };
 
 	private static final Pattern PERSONAL_NUMBER_FORMAT = Pattern.compile("(19|20)[0-9]{10}");
 	private static final String QR_CODE_PREFIX = "bankid.";
+	private static final Pattern REFERRING_DOMAIN = Pattern.compile("[0-9a-z.-]+");
+	private static final Pattern MOBILE_USER_AGENT = Pattern.compile("Android|iPhone|iPad|iPod|Mobile");
 	private static final int QR_CODE_SIZE = 246;
+	private static final SecureRandom RANDOM = new SecureRandom();
 
 	private final BankidIdentityProviderConfig config;
 	private final AuthenticationCallback callback;
@@ -146,7 +162,13 @@ public class BankidEndpoint {
 		clear(authSession);
 		AuthResponse authResponse;
 		try {
-			authResponse = bankidClient.sendAuth(nin, session.getContext().getConnection().getRemoteAddr());
+			String nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes(32));
+			AuthRequest request = new AuthRequest(session.getContext().getConnection().getRemoteAddr());
+			request.setReturnUrl(endpointUri("wait", state) + "#nonce=" + nonce);
+			request.setReturnRisk(true);
+			request.setWeb(webRequestData());
+			authResponse = bankidClient.sendAuth(nin, request);
+			authSession.setAuthNote(RETURN_NONCE, nonce);
 		} catch (BankidClientException e) {
 			return error(e.getHintCode());
 		}
@@ -159,12 +181,83 @@ public class BankidEndpoint {
 		if (nin != null) {
 			authSession.setAuthNote(PERSONAL_NUMBER, nin);
 		}
+		return Response.seeOther(endpointUri("wait", state)).build();
+	}
+
+	/**
+	 * The page of a running order. /start and /login redirect here after they
+	 * create the order, so a reload shows the order again instead of
+	 * creating a new one.
+	 */
+	@GET
+	@Path("/wait")
+	public Response waitPage(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null) {
+			return noSession();
+		}
+		if (authSession.getAuthNote(ORDER_REF) == null) {
+			return error(BankidHintCodes.internal);
+		}
 		return form(authSession)
 				.setAttribute("state", state)
-				.setAttribute("autoStartToken", authResponse.getAutoStartToken())
+				.setAttribute("openUrl", "open?state=" + URLEncoder.encode(state, StandardCharsets.UTF_8))
 				.setAttribute("showqr", config.isShowQRCode())
 				.setAttribute("ninRequired", config.isRequiredNin())
 				.createForm("login-bankid.ftl");
+	}
+
+	/**
+	 * Same device: starts the BankID app on the current order. A mobile
+	 * browser opens the app through its universal link, a desktop browser
+	 * through the bankid: scheme, as BankID's autostart guide says.
+	 */
+	@GET
+	@Path("/open")
+	public Response open(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null) {
+			return noSession();
+		}
+		String token = authSession.getAuthNote(AUTO_START_TOKEN);
+		if (token == null) {
+			return error(BankidHintCodes.internal);
+		}
+		String userAgent = session.getContext().getRequestHeaders().getHeaderString(HttpHeaders.USER_AGENT);
+		boolean mobile = userAgent != null && MOBILE_USER_AGENT.matcher(userAgent).find();
+		String launch = (mobile ? "https://app.bankid.com/" : "bankid:///") + "?autostarttoken="
+				+ URLEncoder.encode(token, StandardCharsets.UTF_8);
+		authSession.setAuthNote(SAME_DEVICE, "true");
+		return Response.seeOther(URI.create(launch)).cacheControl(noStore()).build();
+	}
+
+	private static byte[] randomBytes(int length) {
+		byte[] bytes = new byte[length];
+		RANDOM.nextBytes(bytes);
+		return bytes;
+	}
+
+	/** What BankID's risk indication may know about the browser that starts the order. */
+	private WebRequestData webRequestData() {
+		WebRequestData web = new WebRequestData();
+		String host = session.getContext().getUri().getBaseUri().getHost();
+		if (host != null) {
+			String domain = IDN.toASCII(host).toLowerCase(Locale.ROOT);
+			if (domain.length() >= 3 && REFERRING_DOMAIN.matcher(domain).matches()) {
+				web.setReferringDomain(domain);
+			}
+		}
+		String userAgent = session.getContext().getRequestHeaders().getHeaderString(HttpHeaders.USER_AGENT);
+		if (userAgent != null && !userAgent.isBlank()) {
+			web.setUserAgent(userAgent.length() > 512 ? userAgent.substring(0, 512) : userAgent);
+		}
+		return web.getReferringDomain() == null && web.getUserAgent() == null ? null : web;
+	}
+
+	/** An absolute URL to another call of this endpoint, carrying the state. */
+	private URI endpointUri(String call, String state) {
+		return URI.create(session.getContext().getUri().getAbsolutePath().resolve(call) + "?state="
+				+ URLEncoder.encode(state, StandardCharsets.UTF_8));
 	}
 
 	/**
@@ -173,7 +266,7 @@ public class BankidEndpoint {
 	 */
 	@GET
 	@Path("/collect")
-	public Response collect(@QueryParam("state") String state) {
+	public Response collect(@QueryParam("state") String state, @QueryParam("nonce") String nonce) {
 		AuthenticationSessionModel authSession = authSession(state);
 		if (authSession == null || authSession.getAuthNote(ORDER_REF) == null) {
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
@@ -181,8 +274,20 @@ public class BankidEndpoint {
 		if (!startedHere(authSession)) {
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
 		}
+		// The page sends the nonce from the fragment of the return URL. One
+		// that differs from the session's is not BankID's return for this order.
+		if (nonce != null && !MessageDigest.isEqual(nonce.getBytes(StandardCharsets.US_ASCII),
+				String.valueOf(authSession.getAuthNote(RETURN_NONCE)).getBytes(StandardCharsets.US_ASCII))) {
+			logger.warnf("BankID: the return URL of order %s carries a wrong nonce", authSession.getAuthNote(ORDER_REF));
+			cancelRunning(authSession);
+			clear(authSession);
+			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
+		}
+		if (nonce != null) {
+			authSession.setAuthNote(RETURNED, "true");
+		}
 		if (authSession.getAuthNote(COMPLETION) != null) {
-			return collectAnswer(Status.OK, "complete", null);
+			return completeAnswer(authSession);
 		}
 		String orderRef = authSession.getAuthNote(ORDER_REF);
 		CollectResponse response;
@@ -207,13 +312,19 @@ public class BankidEndpoint {
 				clear(authSession);
 				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
 			}
+			// BankID recommends cancelling an order it rates high risk.
+			if ("high".equals(completion.getRisk())) {
+				logger.warnf("BankID: order %s completed with high risk; refused", orderRef);
+				clear(authSession);
+				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
+			}
 			try {
 				authSession.setAuthNote(COMPLETION, JsonSerialization.writeValueAsString(completion));
 			} catch (IOException e) {
 				clear(authSession);
 				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
 			}
-			return collectAnswer(Status.OK, "complete", null);
+			return completeAnswer(authSession);
 		}
 		clear(authSession);
 		return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", response.getHintCode());
@@ -226,8 +337,9 @@ public class BankidEndpoint {
 		session.getContext().setAuthenticationSession(authSession);
 		String stored = authSession.getAuthNote(COMPLETION);
 		boolean startedHere = startedHere(authSession);
+		boolean returned = returned(authSession);
 		clear(authSession);
-		if (stored == null || !startedHere) {
+		if (stored == null || !startedHere || !returned) {
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
 		}
 		CompletionData completionData;
@@ -366,6 +478,31 @@ public class BankidEndpoint {
 			authSession.removeAuthNote(note);
 		}
 		authSession.removeAuthNote(PROVIDER);
+		authSession.removeAuthNote(SAME_DEVICE);
+		authSession.removeAuthNote(RETURNED);
+	}
+
+	/**
+	 * Whether the browser that holds the session came back through the return
+	 * URL, when the order was started on this device. /open reveals the
+	 * autostart token, and the token in someone else's app completes the
+	 * order; only the device that signed receives the return URL's nonce.
+	 * BankID's auth reference: verify "that the device receiving the
+	 * returnUrl is the same device that started the order".
+	 */
+	private static boolean returned(AuthenticationSessionModel authSession) {
+		return authSession.getAuthNote(SAME_DEVICE) == null || authSession.getAuthNote(RETURNED) != null;
+	}
+
+	/**
+	 * A complete order, or a pending one while the app has not yet returned
+	 * this browser through the return URL.
+	 */
+	private Response completeAnswer(AuthenticationSessionModel authSession) {
+		if (!returned(authSession)) {
+			return collectAnswer(Status.OK, "pending", "userSign");
+		}
+		return collectAnswer(Status.OK, "complete", null);
 	}
 
 	/**

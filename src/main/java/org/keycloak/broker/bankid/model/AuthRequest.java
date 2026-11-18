@@ -20,6 +20,9 @@ public class AuthRequest {
     private String userVisibleData;
     private String userNonVisibleData;
     private String userVisibleDataFormat;
+    private String returnUrl;
+    private Boolean returnRisk;
+    private WebRequestData web;
 
     public AuthRequest(String endUserIp) {
         this.endUserIp = endUserIp;
@@ -85,4 +88,32 @@ public class AuthRequest {
         this.userVisibleDataFormat = userVisibleDataFormat;
     }
 
+    /**
+     * The URL the BankID app opens when a same-device order ends. BankID
+     * recommends it over the deprecated redirect parameter of the autostart
+     * link, and a nonce in its fragment binds the return to the session.
+     */
+    public String getReturnUrl() {
+        return returnUrl;
+    }
+
+    public void setReturnUrl(String returnUrl) {
+        this.returnUrl = returnUrl;
+    }
+
+    public Boolean getReturnRisk() {
+        return returnRisk;
+    }
+
+    public void setReturnRisk(Boolean returnRisk) {
+        this.returnRisk = returnRisk;
+    }
+
+    public WebRequestData getWeb() {
+        return web;
+    }
+
+    public void setWeb(WebRequestData web) {
+        this.web = web;
+    }
 }

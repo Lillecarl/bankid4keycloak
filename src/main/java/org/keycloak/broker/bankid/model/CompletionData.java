@@ -18,6 +18,8 @@ public class CompletionData {
 
 	String ocspResponse;
 
+	String risk;
+
 	public BankidUser getUser() {
 		return user;
 	}
@@ -66,4 +68,12 @@ public class CompletionData {
 		this.ocspResponse = ocspResponse;
 	}
 
+	/** low, medium or high; present only when the order asked for it with returnRisk. */
+	public String getRisk() {
+		return risk;
+	}
+
+	public void setRisk(String risk) {
+		this.risk = risk;
+	}
 }
