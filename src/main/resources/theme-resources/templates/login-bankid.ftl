@@ -17,23 +17,43 @@
 					style="box-sizing: border-box; display: flex; align-items: stretch; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; margin-bottom: 40px; width: 100%;">
 					<p style="max-width: 100%; font-size: 19px; font-family: Helvetica , Arial, sans-serif; font-weight: 400; line-height: 30px; text-align: center; margin-bottom: 0px; margin-top: 0px; padding-bottom: 1px; padding-top: 4px; text-rendering: geometricprecision; -moz-text-size-adjust: none;">
 					<#if ninRequired == true>
-						${msg("bankid.login.text2a",autoStartToken?url('UTF-8'))?no_esc}
+						${msg("bankid.login.text2a",openUrl)?no_esc}
 					</#if>
 					<#if ninRequired == false && showqr == false>
-					    ${msg("bankid.login.text2b",autoStartToken?url('UTF-8'))?no_esc}
+					    ${msg("bankid.login.text2b",openUrl)?no_esc}
 				    </#if>
 					<#if ninRequired == false && showqr == true>
-                        ${msg("bankid.login.text2c",autoStartToken?url('UTF-8'))?no_esc}
+                        ${msg("bankid.login.text2c",openUrl)?no_esc}
                     </#if>
 					</p>
 				</div>
 				<#if showqr == true>
-				<div id="qrcode" style="box-sizing: border-box; display: flex; align-items: stretch; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; margin-bottom: 40px; width: 100%;">
+				<div id="qrcode" style="box-sizing: border-box; display: flex; align-items: stretch; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; margin-bottom: 20px; width: 100%;">
 					<div style="flex: 1 1 0%; text-align: center;">
-						<img id="qrcode-img" alt="" width="246" height="246"/>
+						<button type="button" id="qrcode-button" class="bankid-qr" aria-pressed="false">
+							<img id="qrcode-img" alt="${msg("bankid.qr.alt")}" width="246" height="246"/>
+						</button>
 					</div>
 				</div>
 				</#if>
+				<div id="bankid-timer" style="width: 100%; margin-bottom: 40px; text-align: center;">
+					<progress id="bankid-progress" max="300" value="300" aria-hidden="true" style="width: 246px; max-width: 100%;"></progress>
+					<p id="bankid-countdown" aria-hidden="true" style="margin: 4px 0;"></p>
+					<p id="bankid-announce" class="bankid-sr-only" aria-live="polite"
+					   data-minutes="${msg("bankid.timer.minutes")}" data-minute="${msg("bankid.timer.minute")}"
+					   data-seconds="${msg("bankid.timer.seconds")}"></p>
+					<button type="button" id="bankid-extend" hidden>${msg("bankid.timer.extend")}</button>
+					<p id="bankid-expired" hidden role="alert">${msg("bankid.timer.expired")}
+						<a id="bankid-restart" href="start?state=${state?url('UTF-8')}">${msg("bankid.timer.restart")}</a></p>
+				</div>
+				<style>
+					.bankid-qr { padding: 0; border: 0; background: #fff; cursor: zoom-in; max-width: 100%; }
+					.bankid-qr img { display: block; max-width: 100%; height: auto; }
+					.bankid-qr[aria-pressed="true"] { position: fixed; inset: 0; z-index: 2147483647; width: 100%;
+						display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
+					.bankid-qr[aria-pressed="true"] img { width: min(90vw, 90vh); }
+					.bankid-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+				</style>
 				<div id="loading" style="box-sizing: border-box; display: none; align-items: stretch; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; margin-bottom: 40px; width: 100%;">
 					<p style="max-width: 100%; font-size: 19px; font-family: Helvetica , Arial, sans-serif; font-weight: 400; line-height: 30px; text-align: center; margin-bottom: 0px; margin-top: 0px; padding-bottom: 1px; padding-top: 4px; text-rendering: geometricprecision; -moz-text-size-adjust: none;">${msg("bankid.login.text3")}</p>
 					<div style="flex: 1 1 0%; text-align: center;">

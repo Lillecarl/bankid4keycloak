@@ -46,9 +46,11 @@ public class SimpleBankidClient {
 	}
 
 	public AuthResponse sendAuth(String personalNumber, String endUserIp) {
+		return sendAuth(personalNumber, new AuthRequest(endUserIp));
+	}
 
-		AuthRequest request = new AuthRequest(endUserIp);
-		
+	/** Starts an order from a prepared request, adding the personal number requirement when one is given. */
+	public AuthResponse sendAuth(String personalNumber, AuthRequest request) {
 		if (personalNumber != null) {
 			Requirements requirements = new Requirements();
 			requirements.setPersonalNumber(personalNumber);

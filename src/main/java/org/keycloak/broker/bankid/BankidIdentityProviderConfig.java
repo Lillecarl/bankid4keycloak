@@ -20,6 +20,7 @@ public class BankidIdentityProviderConfig extends IdentityProviderModel {
 	public static final String BANKID_REQUIRE_NIN = "bankid_require_nin";
 	public static final String BANKID_SHOW_QR_CODE = "bankid_show_qr_code";
 	public static final String BANKID_SAVE_NIN_HASH = "bankid_save_nin_hash";
+	public static final String BANKID_PSEUDONYM_SECRET = "bankid_pseudonym_secret";
 	public static final String BANKID_CONNECTION_POOL_SIZE = "bankid_connection_pool_size";
 	public static final String BANKID_MAX_POOLED_PER_ROUTE = "bankid_max_pooled_per_route";
 
@@ -76,6 +77,10 @@ public class BankidIdentityProviderConfig extends IdentityProviderModel {
 		getConfig().put(BANKID_REQUIRE_NIN, String.valueOf(requiredNin));
 	}
 
+
+	public String getPseudonymSecret() {
+		return getConfig().get(BANKID_PSEUDONYM_SECRET);
+	}
 
 	public boolean isSaveNinHashed() {
 		return Boolean.valueOf(getConfig().getOrDefault(BANKID_SAVE_NIN_HASH, "false"));

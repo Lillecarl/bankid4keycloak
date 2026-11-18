@@ -3,12 +3,18 @@ package org.keycloak.broker.bankid;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.net.IDN;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 import javax.crypto.Mac;
@@ -17,11 +23,13 @@ import javax.crypto.spec.SecretKeySpec;
 import org.jboss.logging.Logger;
 import org.keycloak.broker.bankid.client.BankidClientException;
 import org.keycloak.broker.bankid.client.SimpleBankidClient;
+import org.keycloak.broker.bankid.model.AuthRequest;
 import org.keycloak.broker.bankid.model.AuthResponse;
 import org.keycloak.broker.bankid.model.BankidHintCodes;
 import org.keycloak.broker.bankid.model.BankidUser;
 import org.keycloak.broker.bankid.model.CollectResponse;
 import org.keycloak.broker.bankid.model.CompletionData;
+import org.keycloak.broker.bankid.model.WebRequestData;
 import org.keycloak.broker.provider.BrokeredIdentityContext;
 import org.keycloak.broker.provider.UserAuthenticationIdentityProvider.AuthenticationCallback;
 import org.keycloak.broker.provider.util.IdentityBrokerState;
@@ -34,6 +42,7 @@ import org.keycloak.services.managers.AuthenticationSessionManager;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
 import org.keycloak.util.JsonSerialization;
+import org.keycloak.vault.VaultStringSecret;
 
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.client.j2se.MatrixToImageWriter;
@@ -46,6 +55,7 @@ import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.CacheControl;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.Response.Status;
@@ -72,15 +82,27 @@ public class BankidEndpoint {
 	private static final String STARTED = NOTE + "started";
 	private static final String PERSONAL_NUMBER = NOTE + "personalNumber";
 	private static final String COMPLETION = NOTE + "completion";
+	// Set by /open: the autostart token left the server.
+	private static final String SAME_DEVICE = NOTE + "sameDevice";
+	// Set by a collect that carries the return URL's nonce.
+	private static final String RETURNED = NOTE + "returned";
 	// The alias of the provider that started the order. The other notes are
 	// shared by every BankID provider of the realm.
 	private static final String PROVIDER = NOTE + "provider";
+	private static final String RETURN_NONCE = NOTE + "returnNonce";
+	private static final String WINDOW = NOTE + "window";
 	private static final String[] NOTES = { ORDER_REF, AUTO_START_TOKEN, QR_START_TOKEN, QR_START_SECRET, STARTED,
-			PERSONAL_NUMBER, COMPLETION };
+			PERSONAL_NUMBER, COMPLETION, RETURN_NONCE, WINDOW };
+	// BankID's accessibility guidance: at least five minutes to scan, with a
+	// countdown and a way to extend it.
+	private static final long WINDOW_SECONDS = 300;
 
 	private static final Pattern PERSONAL_NUMBER_FORMAT = Pattern.compile("(19|20)[0-9]{10}");
 	private static final String QR_CODE_PREFIX = "bankid.";
+	private static final Pattern REFERRING_DOMAIN = Pattern.compile("[0-9a-z.-]+");
+	private static final Pattern MOBILE_USER_AGENT = Pattern.compile("Android|iPhone|iPad|iPod|Mobile");
 	private static final int QR_CODE_SIZE = 246;
+	private static final SecureRandom RANDOM = new SecureRandom();
 
 	private final BankidIdentityProviderConfig config;
 	private final AuthenticationCallback callback;
@@ -144,27 +166,160 @@ public class BankidEndpoint {
 	private Response doLogin(AuthenticationSessionModel authSession, String nin, String state) {
 		cancelRunning(authSession);
 		clear(authSession);
-		AuthResponse authResponse;
 		try {
-			authResponse = bankidClient.sendAuth(nin, session.getContext().getConnection().getRemoteAddr());
+			begin(authSession, nin, state, now());
 		} catch (BankidClientException e) {
 			return error(e.getHintCode());
 		}
+		return Response.seeOther(endpointUri("wait", state)).build();
+	}
+
+	/**
+	 * Creates an order and keeps it in the session. The window is when the
+	 * page's time limit started: a renewed order keeps it, a new login or an
+	 * extension starts a new one.
+	 */
+	private void begin(AuthenticationSessionModel authSession, String nin, String state, long window) {
+		String nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes(32));
+		AuthRequest request = new AuthRequest(session.getContext().getConnection().getRemoteAddr());
+		request.setReturnUrl(endpointUri("wait", state) + "#nonce=" + nonce);
+		request.setReturnRisk(true);
+		request.setWeb(webRequestData());
+		AuthResponse authResponse = bankidClient.sendAuth(nin, request);
+		clear(authSession);
+		authSession.setAuthNote(RETURN_NONCE, nonce);
 		authSession.setAuthNote(ORDER_REF, authResponse.getOrderRef());
 		authSession.setAuthNote(AUTO_START_TOKEN, authResponse.getAutoStartToken());
 		authSession.setAuthNote(QR_START_TOKEN, authResponse.getQrStartToken());
 		authSession.setAuthNote(QR_START_SECRET, authResponse.getQrStartSecret());
 		authSession.setAuthNote(STARTED, Long.toString(authResponse.getAuthTimestamp()));
 		authSession.setAuthNote(PROVIDER, config.getAlias());
+		authSession.setAuthNote(WINDOW, Long.toString(window));
 		if (nin != null) {
 			authSession.setAuthNote(PERSONAL_NUMBER, nin);
 		}
+	}
+
+	/** Seconds left of the page's time limit. */
+	private static long remaining(AuthenticationSessionModel authSession) {
+		String window = authSession.getAuthNote(WINDOW);
+		return window == null ? 0 : Math.max(0, Long.parseLong(window) + WINDOW_SECONDS - now());
+	}
+
+	private static long now() {
+		return Instant.now().getEpochSecond();
+	}
+
+	/**
+	 * Starts a new order and a new time limit, for the page's extend button.
+	 * Only while no order is under way in the app.
+	 */
+	@POST
+	@Path("/extend")
+	public Response extend(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null || authSession.getAuthNote(ORDER_REF) == null
+				|| authSession.getAuthNote(COMPLETION) != null) {
+			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name(), 0);
+		}
+		// The page's countdown can lag the app: an order the user already
+		// scanned must not be cancelled under them. The page reads the hint.
+		CollectResponse current;
+		try {
+			current = bankidClient.sendCollect(authSession.getAuthNote(ORDER_REF));
+		} catch (BankidClientException e) {
+			return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name(), 0);
+		}
+		String hint = current.getHintCode();
+		if (!"pending".equals(current.getStatus())
+				|| !("outstandingTransaction".equals(hint) || "noClient".equals(hint))) {
+			return collectAnswer(Status.OK, "pending", hint == null ? "userSign" : hint, remaining(authSession));
+		}
+		cancelRunning(authSession);
+		try {
+			begin(authSession, authSession.getAuthNote(PERSONAL_NUMBER), state, now());
+		} catch (BankidClientException e) {
+			clear(authSession);
+			return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name(), 0);
+		}
+		return collectAnswer(Status.OK, "pending", BankidHintCodes.outstandingTransaction.name(),
+				remaining(authSession));
+	}
+
+	/**
+	 * The page of a running order. /start and /login redirect here after they
+	 * create the order, so a reload shows the order again instead of
+	 * creating a new one.
+	 */
+	@GET
+	@Path("/wait")
+	public Response waitPage(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null) {
+			return noSession();
+		}
+		if (authSession.getAuthNote(ORDER_REF) == null) {
+			return error(BankidHintCodes.internal);
+		}
 		return form(authSession)
 				.setAttribute("state", state)
-				.setAttribute("autoStartToken", authResponse.getAutoStartToken())
+				.setAttribute("openUrl", "open?state=" + URLEncoder.encode(state, StandardCharsets.UTF_8))
 				.setAttribute("showqr", config.isShowQRCode())
 				.setAttribute("ninRequired", config.isRequiredNin())
 				.createForm("login-bankid.ftl");
+	}
+
+	/**
+	 * Same device: starts the BankID app on the current order. A mobile
+	 * browser opens the app through its universal link, a desktop browser
+	 * through the bankid: scheme, as BankID's autostart guide says.
+	 */
+	@GET
+	@Path("/open")
+	public Response open(@QueryParam("state") String state) {
+		AuthenticationSessionModel authSession = authSession(state);
+		if (authSession == null) {
+			return noSession();
+		}
+		String token = authSession.getAuthNote(AUTO_START_TOKEN);
+		if (token == null) {
+			return error(BankidHintCodes.internal);
+		}
+		String userAgent = session.getContext().getRequestHeaders().getHeaderString(HttpHeaders.USER_AGENT);
+		boolean mobile = userAgent != null && MOBILE_USER_AGENT.matcher(userAgent).find();
+		String launch = (mobile ? "https://app.bankid.com/" : "bankid:///") + "?autostarttoken="
+				+ URLEncoder.encode(token, StandardCharsets.UTF_8);
+		authSession.setAuthNote(SAME_DEVICE, "true");
+		return Response.seeOther(URI.create(launch)).cacheControl(noStore()).build();
+	}
+
+	private static byte[] randomBytes(int length) {
+		byte[] bytes = new byte[length];
+		RANDOM.nextBytes(bytes);
+		return bytes;
+	}
+
+	/** What BankID's risk indication may know about the browser that starts the order. */
+	private WebRequestData webRequestData() {
+		WebRequestData web = new WebRequestData();
+		String host = session.getContext().getUri().getBaseUri().getHost();
+		if (host != null) {
+			String domain = IDN.toASCII(host).toLowerCase(Locale.ROOT);
+			if (domain.length() >= 3 && REFERRING_DOMAIN.matcher(domain).matches()) {
+				web.setReferringDomain(domain);
+			}
+		}
+		String userAgent = session.getContext().getRequestHeaders().getHeaderString(HttpHeaders.USER_AGENT);
+		if (userAgent != null && !userAgent.isBlank()) {
+			web.setUserAgent(userAgent.length() > 512 ? userAgent.substring(0, 512) : userAgent);
+		}
+		return web.getReferringDomain() == null && web.getUserAgent() == null ? null : web;
+	}
+
+	/** An absolute URL to another call of this endpoint, carrying the state. */
+	private URI endpointUri(String call, String state) {
+		return URI.create(session.getContext().getUri().getAbsolutePath().resolve(call) + "?state="
+				+ URLEncoder.encode(state, StandardCharsets.UTF_8));
 	}
 
 	/**
@@ -173,7 +328,7 @@ public class BankidEndpoint {
 	 */
 	@GET
 	@Path("/collect")
-	public Response collect(@QueryParam("state") String state) {
+	public Response collect(@QueryParam("state") String state, @QueryParam("nonce") String nonce) {
 		AuthenticationSessionModel authSession = authSession(state);
 		if (authSession == null || authSession.getAuthNote(ORDER_REF) == null) {
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
@@ -181,8 +336,20 @@ public class BankidEndpoint {
 		if (!startedHere(authSession)) {
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
 		}
+		// The page sends the nonce from the fragment of the return URL. One
+		// that differs from the session's is not BankID's return for this order.
+		if (nonce != null && !MessageDigest.isEqual(nonce.getBytes(StandardCharsets.US_ASCII),
+				String.valueOf(authSession.getAuthNote(RETURN_NONCE)).getBytes(StandardCharsets.US_ASCII))) {
+			logger.warnf("BankID: the return URL of order %s carries a wrong nonce", authSession.getAuthNote(ORDER_REF));
+			cancelRunning(authSession);
+			clear(authSession);
+			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
+		}
+		if (nonce != null) {
+			authSession.setAuthNote(RETURNED, "true");
+		}
 		if (authSession.getAuthNote(COMPLETION) != null) {
-			return collectAnswer(Status.OK, "complete", null);
+			return completeAnswer(authSession);
 		}
 		String orderRef = authSession.getAuthNote(ORDER_REF);
 		CollectResponse response;
@@ -193,8 +360,32 @@ public class BankidEndpoint {
 			return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name());
 		}
 		String status = response.getStatus();
+		String hint = response.getHintCode();
+		boolean unscanned = "outstandingTransaction".equals(hint) || "noClient".equals(hint);
+		if ("pending".equals(status) && unscanned && remaining(authSession) == 0) {
+			cancelRunning(authSession);
+			clear(authSession);
+			return collectAnswer(Status.OK, "expired", hint, 0);
+		}
 		if ("pending".equals(status)) {
-			return collectAnswer(Status.OK, "pending", response.getHintCode());
+			return collectAnswer(Status.OK, "pending", hint, remaining(authSession));
+		}
+		if ("failed".equals(status) && "startFailed".equals(hint) && remaining(authSession) == 0) {
+			clear(authSession);
+			return collectAnswer(Status.OK, "expired", hint, 0);
+		}
+		// An order nobody started lives 30 seconds. Until the page's time
+		// limit runs out, a new order replaces it, as BankID's QR guide says.
+		if ("failed".equals(status) && "startFailed".equals(hint) && remaining(authSession) > 0) {
+			try {
+				begin(authSession, authSession.getAuthNote(PERSONAL_NUMBER), state,
+						Long.parseLong(authSession.getAuthNote(WINDOW)));
+			} catch (BankidClientException e) {
+				clear(authSession);
+				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name(), 0);
+			}
+			return collectAnswer(Status.OK, "pending", BankidHintCodes.outstandingTransaction.name(),
+					remaining(authSession));
 		}
 		if ("complete".equals(status)) {
 			CompletionData completion = response.getCompletionData();
@@ -207,13 +398,19 @@ public class BankidEndpoint {
 				clear(authSession);
 				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
 			}
+			// BankID recommends cancelling an order it rates high risk.
+			if ("high".equals(completion.getRisk())) {
+				logger.warnf("BankID: order %s completed with high risk; refused", orderRef);
+				clear(authSession);
+				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
+			}
 			try {
 				authSession.setAuthNote(COMPLETION, JsonSerialization.writeValueAsString(completion));
 			} catch (IOException e) {
 				clear(authSession);
 				return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", BankidHintCodes.internal.name());
 			}
-			return collectAnswer(Status.OK, "complete", null);
+			return completeAnswer(authSession);
 		}
 		clear(authSession);
 		return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", response.getHintCode());
@@ -222,19 +419,34 @@ public class BankidEndpoint {
 	@GET
 	@Path("/done")
 	public Response done(@QueryParam("state") String state) {
+		// Before the state is verified, which consumes its session code: a
+		// failure after that leaves the user no page to retry from.
+		String secret;
+		try {
+			secret = pseudonymSecret();
+		} catch (IllegalStateException e) {
+			logger.error("BankID: cannot read the pseudonym secret", e);
+			AuthenticationSessionModel current = authSession(state);
+			if (current == null) {
+				return noSession();
+			}
+			session.getContext().setAuthenticationSession(current);
+			return error(BankidHintCodes.internal);
+		}
 		AuthenticationSessionModel authSession = callback.getAndVerifyAuthenticationSession(state);
 		session.getContext().setAuthenticationSession(authSession);
 		String stored = authSession.getAuthNote(COMPLETION);
 		boolean startedHere = startedHere(authSession);
+		boolean returned = returned(authSession);
 		clear(authSession);
-		if (stored == null || !startedHere) {
+		if (stored == null || !startedHere || !returned) {
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
 		}
 		CompletionData completionData;
 		String username;
 		try {
 			completionData = JsonSerialization.readValue(stored, CompletionData.class);
-			username = getUsername(completionData.getUser());
+			username = getUsername(completionData.getUser(), secret);
 		} catch (IOException | NoSuchAlgorithmException e) {
 			logger.error("BankID: cannot read the completed order", e);
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
@@ -247,6 +459,10 @@ public class BankidEndpoint {
 		identity.setUsername(username);
 		identity.setFirstName(user.getGivenName());
 		identity.setLastName(user.getSurname());
+		if (secret != null) {
+			// Kept on the user, for an admin, instead of in the username.
+			identity.getContextData().put(BankidIdentityProvider.CONTEXT_PERSONAL_NUMBER, user.getPersonalNumber());
+		}
 
 		setUserSessionNote(authSession, ".pnr", username);
 		setUserSessionNote(authSession, ".issuedate", completionData.getBankIdIssueDate());
@@ -265,13 +481,39 @@ public class BankidEndpoint {
 		}
 	}
 
-	private String getUsername(BankidUser user) throws NoSuchAlgorithmException {
+	/**
+	 * The username, which is also the federated id. With a pseudonym secret it
+	 * is HMAC-SHA256(secret, personal number) in hex: stable, and not
+	 * reversible without the secret. The unkeyed hash is reversible: there
+	 * are only a few tens of millions of personal numbers.
+	 */
+	private String getUsername(BankidUser user, String secret) throws NoSuchAlgorithmException {
+		if (secret != null) {
+			try {
+				Mac mac = Mac.getInstance("HmacSHA256");
+				mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+				return HexFormat.of().formatHex(mac.doFinal(user.getPersonalNumber().getBytes(StandardCharsets.UTF_8)));
+			} catch (InvalidKeyException e) {
+				throw new IllegalStateException("BankID: unusable pseudonym secret", e);
+			}
+		}
 		if (this.config.isSaveNinHashed()) {
 			MessageDigest md = MessageDigest.getInstance("SHA-256");
 			md.update(user.getPersonalNumber().getBytes(StandardCharsets.UTF_8));
 			return Base64.getEncoder().encodeToString(md.digest());
 		} else {
 			return user.getPersonalNumber();
+		}
+	}
+
+	private String pseudonymSecret() {
+		String value = config.getPseudonymSecret();
+		if (value == null || value.isEmpty()) {
+			return null;
+		}
+		try (VaultStringSecret secret = session.vault().getStringSecret(value)) {
+			return secret.get().orElseThrow(
+					() -> new IllegalStateException("BankID: the vault has no secret for the pseudonym"));
 		}
 	}
 
@@ -366,6 +608,31 @@ public class BankidEndpoint {
 			authSession.removeAuthNote(note);
 		}
 		authSession.removeAuthNote(PROVIDER);
+		authSession.removeAuthNote(SAME_DEVICE);
+		authSession.removeAuthNote(RETURNED);
+	}
+
+	/**
+	 * Whether the browser that holds the session came back through the return
+	 * URL, when the order was started on this device. /open reveals the
+	 * autostart token, and the token in someone else's app completes the
+	 * order; only the device that signed receives the return URL's nonce.
+	 * BankID's auth reference: verify "that the device receiving the
+	 * returnUrl is the same device that started the order".
+	 */
+	private static boolean returned(AuthenticationSessionModel authSession) {
+		return authSession.getAuthNote(SAME_DEVICE) == null || authSession.getAuthNote(RETURNED) != null;
+	}
+
+	/**
+	 * A complete order, or a pending one while the app has not yet returned
+	 * this browser through the return URL.
+	 */
+	private Response completeAnswer(AuthenticationSessionModel authSession) {
+		if (!returned(authSession)) {
+			return collectAnswer(Status.OK, "pending", "userSign");
+		}
+		return collectAnswer(Status.OK, "complete", null);
 	}
 
 	/**
@@ -407,9 +674,14 @@ public class BankidEndpoint {
 	}
 
 	private static Response collectAnswer(Status httpStatus, String status, String hintCode) {
+		return collectAnswer(httpStatus, status, hintCode, 0);
+	}
+
+	private static Response collectAnswer(Status httpStatus, String status, String hintCode, long remaining) {
 		String body = JsonSerialization.mapper.createObjectNode()
 				.put("status", status)
 				.put("hintCode", hintCode)
+				.put("remaining", remaining)
 				.toString();
 		return Response.status(httpStatus).entity(body).type(MediaType.APPLICATION_JSON_TYPE)
 				.cacheControl(noStore()).build();
