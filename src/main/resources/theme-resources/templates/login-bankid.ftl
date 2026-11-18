@@ -4,7 +4,7 @@
 	<link href="${url.resourcesPath}/css/spin.css" rel="stylesheet" />
 	<script type="text/javascript" src="${url.resourcesPath}/js/spin.umd.js"></script>
     <script src="${url.resourcesPath}/js/bankid.js" type="text/javascript"></script>
-	<div style="box-sizing: border-box; display: flex; align-items: center; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px;">
+	<div id="bankid" data-state="${state}" style="box-sizing: border-box; display: flex; align-items: center; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px;">
 			<div
 				style="box-sizing: border-box; display: flex; align-items: center; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; justify-content: center;">
 				<img alt="" src="${url.resourcesPath}/img/bankid_vector_rgb.svg" style="margin-bottom: 30px;">
@@ -17,20 +17,20 @@
 					style="box-sizing: border-box; display: flex; align-items: stretch; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; margin-bottom: 40px; width: 100%;">
 					<p style="max-width: 100%; font-size: 19px; font-family: Helvetica , Arial, sans-serif; font-weight: 400; line-height: 30px; text-align: center; margin-bottom: 0px; margin-top: 0px; padding-bottom: 1px; padding-top: 4px; text-rendering: geometricprecision; -moz-text-size-adjust: none;">
 					<#if ninRequired == true>
-						${msg("bankid.login.text2a",autoStartToken)?no_esc}
+						${msg("bankid.login.text2a",autoStartToken?url('UTF-8'))?no_esc}
 					</#if>
-					<#if ninRequired == false && showqr == false>					    
-					    ${msg("bankid.login.text2b",autoStartToken)?no_esc}
+					<#if ninRequired == false && showqr == false>
+					    ${msg("bankid.login.text2b",autoStartToken?url('UTF-8'))?no_esc}
 				    </#if>
-					<#if ninRequired == false && showqr == true>                      
-                        ${msg("bankid.login.text2c",autoStartToken)?no_esc}
+					<#if ninRequired == false && showqr == true>
+                        ${msg("bankid.login.text2c",autoStartToken?url('UTF-8'))?no_esc}
                     </#if>
 					</p>
 				</div>
 				<#if showqr == true>
 				<div id="qrcode" style="box-sizing: border-box; display: flex; align-items: stretch; flex-direction: column; flex-shrink: 0; border-style: solid; border-width: 0px; position: relative; z-index: 0; min-height: 0px; min-width: 0px; margin-bottom: 40px; width: 100%;">
 					<div style="flex: 1 1 0%; text-align: center;">
-						<img id="qrcode-img" src="qrcode?bankidref=${bankidref}" onload="pollQrCode()"/>
+						<img id="qrcode-img" alt="" width="246" height="246"/>
 					</div>
 				</div>
 				</#if>
@@ -42,7 +42,6 @@
 				</div>
 			</div>
 			<form novalidate="" action="cancel">
-			<input id="bankidref" name="bankidref" autocorrect="off" autocomplete="off" type="hidden" value="${bankidref}" />
 			<input id="state" name="state" type="hidden" value="${state}" />
 			<button
 				style="padding: 0px; margin: 0px; background-color: rgba(255, 255, 255, 0); border: medium none; cursor: pointer; outline: currentcolor none medium;">
@@ -60,7 +59,6 @@
 			</form>
 		</div>
 <script>
-	var count = 10;
     var opts = {
       lines: 16, // The number of lines to draw
       length: 26, // The length of each line
@@ -82,48 +80,7 @@
       position: 'absolute' // Element positioning
     };
 
-	poll(
-	    function() {
-	    
-	    	const req = window.XMLHttpRequest ? new XMLHttpRequest() : new ActiveXObject("Microsoft.XMLHTTP");
-	    	const url='collect?bankidref=${bankidref}';
-	    	req.open("GET", url, false);
-	    	req.send();
-	    	
-	    	if(req.status==200) {
-	    	    var response = JSON.parse(req.responseText);
-	    	    if ( response.status == 'complete' ) {
-    				return true;
-				} else if ( response.status == 'pending' 
-					&& (response.hintCode == 'started' || response.hintCode == 'userSign')  ) {
-					let qrcode = document.getElementById('qrcode');
-					if ( qrcode !== null ) {
-					  qrcode.style.display = 'none';
-					}
-					let target = document.getElementById('progress-loader');
-					let loading = document.getElementById('loading').style.display = 'flex';
-    				if ( target !== null && loading !== null) {
-						let spinner = new Spin.Spinner(opts).spin(target);
-    					document.getElementById('loading').style.display = 'flex';
-					}
-				}	
-    		}
-    		else if( req.status!=200 ) {
-    			redirectToError(JSON.parse(req.responseText).hintCode);	
-    		}
-	        return false;
-	    },
-	    function() {
-	        // Done, success callback
-        	redirectToDone('${bankidref}', '${state}');
-	    },
-	    function() {
-	        // Error, failure callback
-	        redirectToError('expiredTransaction')
-	    },
-	    120000, // timeout
-	    2000 // interval
-	);
+	startBankidLogin(opts);
 </script>
 </#if>
 </@layout.registrationLayout>

@@ -31,4 +31,16 @@ public enum BankidHintCodes {
 	private BankidHintCodes(String messageShortName) {
 		this.messageShortName = messageShortName;
 	}
+
+	/** The hint for a code from BankID or the browser; an unknown code, null included, maps to {@link #unkown}. */
+	public static BankidHintCodes of(String code) {
+		if (code != null) {
+			for (BankidHintCodes hint : values()) {
+				if (hint.name().equals(code)) {
+					return hint;
+				}
+			}
+		}
+		return unkown;
+	}
 }
