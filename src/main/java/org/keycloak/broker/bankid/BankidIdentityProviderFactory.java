@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.http.client.HttpClient;
@@ -36,6 +38,12 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 	/** One pooled client per identity provider, rebuilt when its configuration or key stores change. */
 	private static final Map<String, Loaded> CLIENTS = new ConcurrentHashMap<>();
 
+	private static final ScheduledExecutorService RETIRE = Executors.newSingleThreadScheduledExecutor(task -> {
+		Thread thread = new Thread(task, "bankid-client-retire");
+		thread.setDaemon(true);
+		return thread;
+	});
+
 	@Override
 	public String getName() {
 		return "BankID e-legitimation";
@@ -55,7 +63,9 @@ public class BankidIdentityProviderFactory extends AbstractIdentityProviderFacto
 			Loaded fresh = new Loaded(version,
 					new SimpleBankidClient(buildBankidHttpClient(resolved), config.getApiUrl()));
 			if (current != null) {
-				current.client().close();
+				// Requests in flight still hold the old client, and a closed pool
+				// throws at them. They end within the connect and socket timeouts.
+				RETIRE.schedule(current.client()::close, 60, TimeUnit.SECONDS);
 			}
 			return fresh;
 		});
