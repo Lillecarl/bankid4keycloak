@@ -1,5 +1,6 @@
 package org.keycloak.broker.bankid.client;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
@@ -32,6 +33,16 @@ public class SimpleBankidClient {
 	public SimpleBankidClient(HttpClient bankidHttpClient, String baseUrl) {
 		this.bankidHttpClient = bankidHttpClient;
 		this.baseUrl = baseUrl;
+	}
+
+	public void close() {
+		if (bankidHttpClient instanceof Closeable closeable) {
+			try {
+				closeable.close();
+			} catch (IOException e) {
+				logger.warn("Failed to close the BankID HTTP client", e);
+			}
+		}
 	}
 
 	public AuthResponse sendAuth(String personalNumber, String endUserIp) {
@@ -89,6 +100,9 @@ public class SimpleBankidClient {
 			request.setHeader(HttpHeaders.ACCEPT, "application/json");
 
 			Response response = new Response(this.bankidHttpClient.execute(request), MAX_CONSUMED_RESPONSE_SIZE);
+			// Reading the body returns the connection to the pool. A caller that
+			// ignores the response, as sendCancel does, would otherwise hold it.
+			response.asString();
 
 			switch (response.getStatus()) {
 				case 200:
@@ -135,7 +149,7 @@ public class SimpleBankidClient {
 					path,
 					response.getStatus(),
 					responseJson.toString());
-			throw new BankidClientException(BankidHintCodes.valueOf(responseJson.get("errorCode").textValue()));
+			throw new BankidClientException(BankidHintCodes.of(responseJson.path("errorCode").asText(null)));
 		} catch (IOException e) {
 			throw new BankidClientException(BankidHintCodes.internal);
 		}
