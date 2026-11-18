@@ -220,6 +220,19 @@ public class BankidEndpoint {
 				|| authSession.getAuthNote(COMPLETION) != null) {
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name(), 0);
 		}
+		// The page's countdown can lag the app: an order the user already
+		// scanned must not be cancelled under them. The page reads the hint.
+		CollectResponse current;
+		try {
+			current = bankidClient.sendCollect(authSession.getAuthNote(ORDER_REF));
+		} catch (BankidClientException e) {
+			return collectAnswer(Status.INTERNAL_SERVER_ERROR, "failed", e.getHintCode().name(), 0);
+		}
+		String hint = current.getHintCode();
+		if (!"pending".equals(current.getStatus())
+				|| !("outstandingTransaction".equals(hint) || "noClient".equals(hint))) {
+			return collectAnswer(Status.OK, "pending", hint == null ? "userSign" : hint, remaining(authSession));
+		}
 		cancelRunning(authSession);
 		try {
 			begin(authSession, authSession.getAuthNote(PERSONAL_NUMBER), state, now());

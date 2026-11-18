@@ -36,6 +36,10 @@ function startBankidLogin(spinnerOptions) {
 	let ticker = null;
 	let lastStep = null;
 	let polling = true;
+	// The collect in flight. Extend waits for it: the server keeps the order
+	// in the session, and the later of two writes wins.
+	let collecting = null;
+	let extending = false;
 
 	function frame() {
 		qrcodeImg.src = 'qrcode?' + query + '&t=' + Date.now();
@@ -54,6 +58,7 @@ function startBankidLogin(spinnerOptions) {
 			ticker = null;
 		}
 		document.getElementById('bankid-timer').hidden = true;
+		extendButton.hidden = true;
 	}
 
 	function setFullScreen(on) {
@@ -135,18 +140,27 @@ function startBankidLogin(spinnerOptions) {
 	}
 
 	async function extend() {
-		if (extendButton.hidden) {
+		if (extendButton.hidden || extending) {
 			return;
 		}
+		extending = true;
 		let answer;
 		try {
+			await collecting;
 			const response = await fetch('extend?' + query, { method: 'POST', cache: 'no-store' });
 			answer = await response.json();
 		} catch (e) {
 			return;
+		} finally {
+			extending = false;
 		}
 		if (answer.status !== 'pending') {
 			redirectToError(answer.hintCode);
+			return;
+		}
+		if (answer.hintCode !== 'outstandingTransaction' && answer.hintCode !== 'noClient') {
+			// The user already scanned; the server extended nothing.
+			showProgress();
 			return;
 		}
 		lastStep = null;
@@ -160,13 +174,19 @@ function startBankidLogin(spinnerOptions) {
 		if (!polling) {
 			return;
 		}
+		if (extending) {
+			setTimeout(poll, 500);
+			return;
+		}
 		let answer;
 		try {
-			const response = await fetch('collect?' + collectQuery, { cache: 'no-store' });
-			answer = await response.json();
+			collecting = fetch('collect?' + collectQuery, { cache: 'no-store' }).then((r) => r.json());
+			answer = await collecting;
 		} catch (e) {
 			setTimeout(poll, 2000);
 			return;
+		} finally {
+			collecting = null;
 		}
 		if (answer.status === 'complete') {
 			polling = false;
