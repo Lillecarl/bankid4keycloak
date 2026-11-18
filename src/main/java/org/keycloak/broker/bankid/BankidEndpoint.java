@@ -335,6 +335,20 @@ public class BankidEndpoint {
 	@GET
 	@Path("/done")
 	public Response done(@QueryParam("state") String state) {
+		// Before the state is verified, which consumes its session code: a
+		// failure after that leaves the user no page to retry from.
+		String secret;
+		try {
+			secret = pseudonymSecret();
+		} catch (IllegalStateException e) {
+			logger.error("BankID: cannot read the pseudonym secret", e);
+			AuthenticationSessionModel current = authSession(state);
+			if (current == null) {
+				return noSession();
+			}
+			session.getContext().setAuthenticationSession(current);
+			return error(BankidHintCodes.internal);
+		}
 		AuthenticationSessionModel authSession = callback.getAndVerifyAuthenticationSession(state);
 		session.getContext().setAuthenticationSession(authSession);
 		String stored = authSession.getAuthNote(COMPLETION);
@@ -348,7 +362,7 @@ public class BankidEndpoint {
 		String username;
 		try {
 			completionData = JsonSerialization.readValue(stored, CompletionData.class);
-			username = getUsername(completionData.getUser());
+			username = getUsername(completionData.getUser(), secret);
 		} catch (IOException | NoSuchAlgorithmException e) {
 			logger.error("BankID: cannot read the completed order", e);
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
@@ -361,7 +375,7 @@ public class BankidEndpoint {
 		identity.setUsername(username);
 		identity.setFirstName(user.getGivenName());
 		identity.setLastName(user.getSurname());
-		if (pseudonymSecret() != null) {
+		if (secret != null) {
 			// Kept on the user, for an admin, instead of in the username.
 			identity.getContextData().put(BankidIdentityProvider.CONTEXT_PERSONAL_NUMBER, user.getPersonalNumber());
 		}
@@ -389,8 +403,7 @@ public class BankidEndpoint {
 	 * reversible without the secret. The unkeyed hash is reversible: there
 	 * are only a few tens of millions of personal numbers.
 	 */
-	private String getUsername(BankidUser user) throws NoSuchAlgorithmException {
-		String secret = pseudonymSecret();
+	private String getUsername(BankidUser user, String secret) throws NoSuchAlgorithmException {
 		if (secret != null) {
 			try {
 				Mac mac = Mac.getInstance("HmacSHA256");
