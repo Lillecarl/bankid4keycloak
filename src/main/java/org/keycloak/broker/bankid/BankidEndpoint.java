@@ -72,6 +72,9 @@ public class BankidEndpoint {
 	private static final String STARTED = NOTE + "started";
 	private static final String PERSONAL_NUMBER = NOTE + "personalNumber";
 	private static final String COMPLETION = NOTE + "completion";
+	// The alias of the provider that started the order. The other notes are
+	// shared by every BankID provider of the realm.
+	private static final String PROVIDER = NOTE + "provider";
 	private static final String[] NOTES = { ORDER_REF, AUTO_START_TOKEN, QR_START_TOKEN, QR_START_SECRET, STARTED,
 			PERSONAL_NUMBER, COMPLETION };
 
@@ -152,6 +155,7 @@ public class BankidEndpoint {
 		authSession.setAuthNote(QR_START_TOKEN, authResponse.getQrStartToken());
 		authSession.setAuthNote(QR_START_SECRET, authResponse.getQrStartSecret());
 		authSession.setAuthNote(STARTED, Long.toString(authResponse.getAuthTimestamp()));
+		authSession.setAuthNote(PROVIDER, config.getAlias());
 		if (nin != null) {
 			authSession.setAuthNote(PERSONAL_NUMBER, nin);
 		}
@@ -172,6 +176,9 @@ public class BankidEndpoint {
 	public Response collect(@QueryParam("state") String state) {
 		AuthenticationSessionModel authSession = authSession(state);
 		if (authSession == null || authSession.getAuthNote(ORDER_REF) == null) {
+			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
+		}
+		if (!startedHere(authSession)) {
 			return collectAnswer(Status.BAD_REQUEST, "failed", BankidHintCodes.internal.name());
 		}
 		if (authSession.getAuthNote(COMPLETION) != null) {
@@ -218,8 +225,9 @@ public class BankidEndpoint {
 		AuthenticationSessionModel authSession = callback.getAndVerifyAuthenticationSession(state);
 		session.getContext().setAuthenticationSession(authSession);
 		String stored = authSession.getAuthNote(COMPLETION);
+		boolean startedHere = startedHere(authSession);
 		clear(authSession);
-		if (stored == null) {
+		if (stored == null || !startedHere) {
 			return callback.error(config, "bankid.hints." + BankidHintCodes.internal.messageShortName);
 		}
 		CompletionData completionData;
@@ -357,6 +365,16 @@ public class BankidEndpoint {
 		for (String note : NOTES) {
 			authSession.removeAuthNote(note);
 		}
+		authSession.removeAuthNote(PROVIDER);
+	}
+
+	/**
+	 * Whether this provider started the session's order. Without the check, a
+	 * realm's test provider, where anyone can make a BankID for any personal
+	 * number, could complete an order that its production provider then accepts.
+	 */
+	private boolean startedHere(AuthenticationSessionModel authSession) {
+		return config.getAlias().equals(authSession.getAuthNote(PROVIDER));
 	}
 
 	/**
